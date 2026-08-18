@@ -173,7 +173,55 @@ class GeoPipeline:
         if progress_callback:
             progress_callback("_rerank", "done")
 
-        # ── Compute consensus ────────────────────────────────────────────
+        # ── Inject exact GPS coordinates from EXIF (bypass grid) ────────
+        # When EXIF finds GPS data, we have exact coordinates (within ~5m).
+        # The grid is 1°×1° (~111km per cell), so grid candidates are
+        # always off by up to ~55km. Inject the exact EXIF coordinates as
+        # the #1 candidate for sub-100m accuracy on GPS-enabled images.
+        exact_injected = False
+        if "exif" in all_hits and all_hits["exif"]:
+            exif_hits = all_hits["exif"]
+            # Take the highest-confidence EXIF hit
+            best_exif = max(exif_hits, key=lambda h: h.confidence)
+            if best_exif.confidence >= 0.5:
+                from geofind.core.candidate import CandidateLocation
+                exact_cand = CandidateLocation(
+                    lat=best_exif.lat,
+                    lon=best_exif.lon,
+                    probability=1.0,  # Will be normalized later
+                    log_posterior=0.0,
+                    hits=[best_exif],
+                    is_exact=True,
+                )
+                # Find the grid candidate closest to this EXIF point and
+                # attach its module hits to the exact candidate for display
+                from geofind.utils.geo import haversine_km, LatLon as _LL
+                exif_point = _LL(best_exif.lat, best_exif.lon)
+                best_grid_dist = float("inf")
+                for c in candidates:
+                    d = haversine_km(exif_point, _LL(c.lat, c.lon))
+                    if d < best_grid_dist:
+                        best_grid_dist = d
+                        for h in c.hits:
+                            if h.module != "exif":
+                                exact_cand.add_hit(h)
+
+                # Inject at position 0, shifting everything else down
+                candidates.insert(0, exact_cand)
+                exact_injected = True
+                console.print(
+                    f"  [bold green]✓[/] EXIF exact GPS injected: "
+                    f"{best_exif.lat:.6f}, {best_exif.lon:.6f} "
+                    f"(±~5m, vs grid cell {best_grid_dist:.0f}km away)"
+                )
+
+        # ── Normalize probabilities ────────────────────────────────────
+        total_prob = sum(c.probability for c in candidates)
+        if total_prob > 0:
+            for c in candidates:
+                c.probability /= total_prob
+
+        # ── Compute consensus ────────────────────────────────────────
         consensus = self.reranker.compute_consensus(all_hits, module_weights)
 
         # ── Build result ─────────────────────────────────────────────────
@@ -377,10 +425,11 @@ class GeoPipeline:
 
         if result.top_candidate:
             tc = result.top_candidate
+            exact_tag = " [bold yellow](EXACT GPS)[/]" if tc.is_exact else ""
             console.print(
                 f"  [bold green]Top candidate:[/] "
-                f"{tc.lat:.4f}, {tc.lon:.4f} "
-                f"(p={tc.probability:.6f})"
+                f"{tc.lat:.6f}, {tc.lon:.6f} "
+                f"(p={tc.probability:.6f}){exact_tag}"
             )
         else:
             console.print("  [yellow]No candidates found[/]")

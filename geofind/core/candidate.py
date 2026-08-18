@@ -25,6 +25,7 @@ class CandidateLocation:
     log_posterior: float = 0.0
     hits: list[ModuleHit] = field(default_factory=list)
     buff_multiplier: float = 1.0
+    is_exact: bool = False  # True when coords are from a precision source (e.g. EXIF GPS)
 
     @property
     def country_hint(self) -> str:
