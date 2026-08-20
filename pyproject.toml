@@ -16,6 +16,7 @@ dependencies = [
     "Pillow>=10.0",
     "exifread>=3.0",
     "langdetect>=1.0.9",
+    "requests>=2.28",
 ]
 
 [project.scripts]

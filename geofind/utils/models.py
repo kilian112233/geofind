@@ -119,6 +119,21 @@ def clear_model_cache() -> None:
     _model_cache.clear()
 
 
+def get_clip_shared() -> tuple[Any, Any]:
+    """Get a shared CLIP model+processor. All CLIP-based modules use this."""
+    return get_cached_model("clip_shared", _load_clip)
+
+
+def _load_clip():
+    """Load CLIP model + processor once."""
+    from transformers import CLIPProcessor, CLIPModel
+    model_name = ensure_clip_model()
+    model = CLIPModel.from_pretrained(model_name)
+    processor = CLIPProcessor.from_pretrained(model_name)
+    model.eval()
+    return model, processor
+
+
 def get_cache_info() -> dict[str, bool]:
     """Report which models are currently cached in memory."""
     return {k: True for k in _model_cache}

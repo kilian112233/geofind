@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
@@ -11,6 +12,18 @@ from geofind.core.candidate import CandidateLocation, ModuleHit
 from geofind.core.config import PipelineConfig
 from geofind.core.grid import GeoGrid
 from geofind.utils.geo import LatLon, haversine_km
+
+logger = logging.getLogger(__name__)
+
+
+def _hav_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Haversine distance between two points in km."""
+    lat1r, lon1r = math.radians(lat1), math.radians(lon1)
+    lat2r, lon2r = math.radians(lat2), math.radians(lon2)
+    dl = lat2r - lat1r
+    dn = lon2r - lon1r
+    a = math.sin(dl / 2) ** 2 + math.cos(lat1r) * math.cos(lat2r) * math.sin(dn / 2) ** 2
+    return 2 * 6371 * math.asin(math.sqrt(min(a, 1.0)))
 
 
 class BayesianReranker:
@@ -36,16 +49,15 @@ class BayesianReranker:
             return []
 
         # ── Pass 2: Consensus clustering buff ───────────────────────────────
-        candidates, consensus = self._apply_consensus_buff(candidates, module_weights)
+        candidates, consensus = self._apply_consensus_buff(
+            candidates, module_weights, all_hits,
+        )
 
-        # Apply buffs directly to probabilities (not via grid re-computation
-        # which had index-mapping bugs). The buff multipliers from Pass 2
-        # scale each candidate's posterior probability.
+        # Apply buffs directly to probabilities
         total_prob = sum(c.probability for c in candidates)
         if total_prob > 0:
             for c in candidates:
                 c.probability = (c.probability / total_prob) * c.buff_multiplier
-            # Renormalize
             total_prob = sum(c.probability for c in candidates)
             if total_prob > 0:
                 for c in candidates:
@@ -63,82 +75,131 @@ class BayesianReranker:
         self,
         candidates: list[CandidateLocation],
         weights: dict[str, float],
+        all_hits: dict[str, list[ModuleHit]],
     ) -> tuple[list[CandidateLocation], dict[str, Any]]:
-        """Apply consensus clustering boost to candidates.
+        """Apply consensus clustering boost using MODULE-LEVEL agreement.
 
-        Boosts candidates closest to the consensus centroid (proximity-based),
-        not those highest in the ranked list. This ensures precise modules
-        like EXIF are properly boosted when they agree with each other.
-
-        Returns updated candidates and consensus metadata.
+        Each module produces a weighted centroid from its hits.
+        We find the densest cluster of module centroids within 500km,
+        then boost candidates near that cluster.
         """
         if not candidates:
-            return candidates, {"centroid": None, "strength": 0.0}
+            return candidates, {"centroid_lat": None, "centroid_lon": None, "strength": 0.0}
 
-        # Find the centroid of "definitive" candidates (those with multiple
-        # module hits confirming the same area)
-        definitive = [c for c in candidates[:100] if len(c.hits) >= 2]
-        if not definitive:
-            # Fall back to top candidates by probability
-            definitive = candidates[:20]
+        # ── Compute per-module centroids ─────────────────────────────────
+        module_centroids: list[tuple[float, float, float, str]] = []
+        for mod_name, hits in all_hits.items():
+            if not hits:
+                continue
+            mod_weight = weights.get(mod_name, 1.0)
+            w_sum = sum(h.confidence for h in hits)
+            if w_sum == 0:
+                continue
+            m_lat = sum(h.confidence * h.lat for h in hits) / w_sum
+            m_lon = sum(h.confidence * h.lon for h in hits) / w_sum
+            module_centroids.append((m_lat, m_lon, mod_weight, mod_name))
 
-        # Weighted centroid from definitive candidates
-        total_weight = sum(
-            max(h.confidence, 0.01) for c in definitive for h in c.hits
+        if not module_centroids:
+            return candidates, {"centroid_lat": None, "centroid_lon": None, "strength": 0.0}
+
+        # ── Find the densest cluster of module centroids ─────────────────
+        best_cluster_size = 0
+        best_lat, best_lon = 0.0, 0.0
+        best_total_weight = 0.0
+
+        for i in range(len(module_centroids)):
+            lat_i, lon_i, _, _ = module_centroids[i]
+            count = 0
+            w_lat, w_lon, w_sum = 0.0, 0.0, 0.0
+            for j in range(len(module_centroids)):
+                lat_j, lon_j, w_j, _ = module_centroids[j]
+                if _hav_km(lat_i, lon_i, lat_j, lon_j) < 300:
+                    count += 1
+                    w_lat += lat_j * w_j
+                    w_lon += lon_j * w_j
+                    w_sum += w_j
+            if count > best_cluster_size or (count == best_cluster_size and w_sum > best_total_weight):
+                best_cluster_size = count
+                best_total_weight = w_sum
+                best_lat = w_lat / max(w_sum, 1e-9)
+                best_lon = w_lon / max(w_sum, 1e-9)
+
+        # ── Compute agreement strength ──────────────────────────────────
+        # Base: fraction of all modules in the best cluster
+        base_strength = best_cluster_size / max(len(module_centroids), 1)
+
+        # Boost when high-weight modules agree
+        high_weight_agreeing = sum(
+            1 for lat_i, lon_i, w_i, _ in module_centroids
+            if w_i >= 2.0 and _hav_km(lat_i, lon_i, best_lat, best_lon) < 500
         )
-        if total_weight == 0:
-            return candidates, {"centroid": None, "strength": 0.0}
-
-        centroid_lat = sum(
-            c.lat * sum(max(h.confidence, 0.01) for h in c.hits)
-            for c in definitive
-        ) / total_weight
-        centroid_lon = sum(
-            c.lon * sum(max(h.confidence, 0.01) for h in c.hits)
-            for c in definitive
-        ) / total_weight
-        centroid = LatLon(centroid_lat, centroid_lon)
-
-        # Compute distances from centroid for all candidates
-        dists = [
-            haversine_km(centroid, LatLon(c.lat, c.lon))
-            for c in candidates
-        ]
-
-        # Compute agreement strength: how tightly clustered are top hits?
-        top_dists = dists[:min(20, len(dists))]
-        if top_dists:
-            avg_dist = sum(top_dists) / len(top_dists)
-            # Strength: 1.0 when avg_dist < 100km, approaching 0 when > 2000km
-            strength = max(0.0, min(1.0, 1.0 - (avg_dist - 100) / 1900))
+        high_weight_total = sum(
+            1 for _, _, w_i, _ in module_centroids if w_i >= 2.0
+        )
+        if high_weight_total > 0:
+            hw_ratio = high_weight_agreeing / high_weight_total
+            strength = 0.6 * base_strength + 0.4 * hw_ratio
         else:
-            strength = 0.0
+            strength = base_strength
 
-        # Sort candidates by distance to centroid (closest first)
-        sorted_by_dist = sorted(range(len(candidates)), key=lambda i: dists[i])
+        # Pair agreement bonus for high-weight modules
+        high_weight_names = {"geoclip", "landmark", "clip_visual", "vision_llm"}
+        hw_centroids = [
+            (lat, lon, name) for lat, lon, w, name in module_centroids
+            if name in high_weight_names
+        ]
+        for i in range(len(hw_centroids)):
+            for j in range(i + 1, len(hw_centroids)):
+                if _hav_km(hw_centroids[i][0], hw_centroids[i][1],
+                           hw_centroids[j][0], hw_centroids[j][1]) < 300:
+                    strength = max(strength, 0.5)
+                    break
+            if strength >= 0.5:
+                break
+
+        logger.info(
+            f"[reranker] Consensus: {best_cluster_size}/{len(module_centroids)} modules "
+            f"agree within 300km, strength={strength:.2f}, "
+            f"centroid=({best_lat:.2f}, {best_lon:.2f})"
+        )
+
+        # ── Apply proximity-based buffs to candidates ────────────────────
+        c_lats = np.array([c.lat for c in candidates], dtype=np.float64)
+        c_lons = np.array([c.lon for c in candidates], dtype=np.float64)
+        c_lat_rad = np.radians(c_lats)
+        c_lon_rad = np.radians(c_lons)
+        clat_rad = math.radians(best_lat)
+        clon_rad = math.radians(best_lon)
+
+        dlat = clat_rad - c_lat_rad
+        dlon = clon_rad - c_lon_rad
+        h = (np.sin(dlat / 2) ** 2
+             + np.cos(clat_rad) * np.cos(c_lat_rad) * np.sin(dlon / 2) ** 2)
+        dists = 2 * 6371.0 * np.arcsin(np.sqrt(np.minimum(h, 1.0)))
+
+        # Sort candidates by distance to centroid
+        sorted_by_dist = np.argsort(dists)
         top_n = self.config.consensus_top_n
         top_half = len(candidates) // 2
 
-        # Apply proximity-based buffs: closest to centroid get the biggest boost
         for i in range(len(candidates)):
             candidates[i].buff_multiplier = 1.0
 
         for rank, idx in enumerate(sorted_by_dist):
             if rank < top_n:
-                candidates[idx].buff_multiplier = self.config.consensus_top_n_buff
+                candidates[idx].buff_multiplier = 5.0  # Strong boost for consensus leaders
             elif rank < top_half:
-                candidates[idx].buff_multiplier = self.config.consensus_top_half_buff
+                candidates[idx].buff_multiplier = 2.0
             else:
                 candidates[idx].buff_multiplier = 1.0
-
             # Scale buff by agreement strength
             candidates[idx].buff_multiplier = 1.0 + (candidates[idx].buff_multiplier - 1.0) * strength
 
         consensus = {
-            "centroid_lat": centroid_lat,
-            "centroid_lon": centroid_lon,
+            "centroid_lat": best_lat,
+            "centroid_lon": best_lon,
             "strength": strength,
-            "definitive_count": len(definitive),
+            "definitive_count": best_cluster_size,
         }
 
         return candidates, consensus
@@ -151,33 +212,40 @@ class BayesianReranker:
     ) -> list[CandidateLocation]:
         """Pass 3: Calibrate based on module agreement with consensus.
 
-        Instead of penalizing candidates far from consensus (which would
-        hurt precise modules like EXIF when consensus is wrong), we boost
-        candidates that have high-confidence module hits agreeing with
-        each other. The key insight: a candidate with a high-weight module
-        hit (e.g. EXIF GPS) should not be downweighted by fuzzy consensus.
+        Boosts candidates that have high-confidence module hits agreeing with
+        each other. Vectorized haversine for performance.
         """
         if not candidates or not consensus.get("centroid_lat"):
             return candidates
 
-        centroid = LatLon(consensus["centroid_lat"], consensus["centroid_lon"])
+        centroid_lat = consensus["centroid_lat"]
+        centroid_lon = consensus["centroid_lon"]
 
-        # For each candidate, compute a confidence bonus based on:
-        # 1. Number of modules that agree (hit count)
-        # 2. Whether the highest-weight module (EXIF) hit this location
-        for candidate in candidates:
-            cand_point = LatLon(candidate.lat, candidate.lon)
-            dist_to_centroid = haversine_km(cand_point, centroid)
+        # Vectorized distance from centroid for all candidates
+        c_lats = np.array([c.lat for c in candidates], dtype=np.float64)
+        c_lons = np.array([c.lon for c in candidates], dtype=np.float64)
+        c_lat_rad = np.radians(c_lats)
+        c_lon_rad = np.radians(c_lons)
+        clat_rad = math.radians(centroid_lat)
+        clon_rad = math.radians(centroid_lon)
 
-            # Mild proximity factor — only penalize very far candidates
-            # (e.g. >3000km from consensus), and only slightly
-            if dist_to_centroid > 3000:
+        dlat = clat_rad - c_lat_rad
+        dlon = clon_rad - c_lon_rad
+        h = (np.sin(dlat / 2) ** 2
+             + np.cos(clat_rad) * np.cos(c_lat_rad) * np.sin(dlon / 2) ** 2)
+        dists_to_centroid = 2 * 6371.0 * np.arcsin(np.sqrt(np.minimum(h, 1.0)))
+
+        for i, candidate in enumerate(candidates):
+            dist = float(dists_to_centroid[i])
+
+            # Proximity penalty for far-away candidates
+            if dist > 3000:
                 proximity_factor = math.exp(
-                    -((dist_to_centroid - 3000) ** 2) / (2 * 5000 ** 2)
+                    -((dist - 3000) ** 2) / (2 * 5000 ** 2)
                 )
                 candidate.probability *= (0.8 + 0.2 * proximity_factor)
 
-            # Bonus for multi-module agreement
+            # Bonus for multi-module agreement at this candidate
             if len(candidate.hits) >= 3:
                 candidate.probability *= 1.2
             elif len(candidate.hits) >= 2:
@@ -196,14 +264,7 @@ class BayesianReranker:
         all_hits: dict[str, list[ModuleHit]],
         weights: dict[str, float],
     ) -> dict[str, Any]:
-        """Compute consensus from per-module centroids.
-
-        Each module produces a single centroid from its hits, weighted by
-        module weight and hit confidence. The overall consensus is the
-        weighted average of these module centroids. Agreement strength
-        measures how many module centroids cluster within 500km.
-        """
-        # Compute per-module centroids (weighted by hit confidence)
+        """Compute consensus from per-module centroids."""
         module_centroids: list[tuple[float, LatLon]] = []
         for mod_name, hits in all_hits.items():
             if not hits:
@@ -214,7 +275,6 @@ class BayesianReranker:
                 continue
             m_lat = sum(h.confidence * h.lat for h in hits) / w_sum
             m_lon = sum(h.confidence * h.lon for h in hits) / w_sum
-            # Weight the module centroid by module weight
             module_centroids.append((mod_weight, LatLon(m_lat, m_lon)))
 
         if not module_centroids:
@@ -225,13 +285,11 @@ class BayesianReranker:
                 "modules_agreeing": 0,
             }
 
-        # Overall centroid = weighted average of module centroids
         total_w = sum(w for w, _ in module_centroids)
         centroid_lat = sum(w * mc.lat for w, mc in module_centroids) / total_w
         centroid_lon = sum(w * mc.lon for w, mc in module_centroids) / total_w
         centroid = LatLon(centroid_lat, centroid_lon)
 
-        # How many module centroids are within 500km of overall centroid
         agreeing = sum(
             1 for _, mc in module_centroids
             if haversine_km(mc, centroid) < 500

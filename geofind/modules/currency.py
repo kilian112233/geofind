@@ -43,19 +43,10 @@ class CurrencyModule(BaseModule):
             return False
 
     def prepare(self) -> None:
-        from geofind.utils.models import get_cached_model, ensure_clip_model
+        from geofind.utils.models import get_clip_shared
         from geofind.utils.constants import CURRENCY_PROMPTS
 
-        model_name = ensure_clip_model()
-
-        def _load():
-            from transformers import CLIPProcessor, CLIPModel
-            model = CLIPModel.from_pretrained(model_name)
-            processor = CLIPProcessor.from_pretrained(model_name)
-            model.eval()
-            return model, processor
-
-        self._model, self._processor = get_cached_model("clip_currency", _load)
+        self._model, self._processor = get_clip_shared()
         self._currency_prompts = CURRENCY_PROMPTS
 
         self._all_prompts: list[str] = []
@@ -119,9 +110,11 @@ class CurrencyModule(BaseModule):
                 confidence = min(norm_score / n, 0.8)
                 hits.append(self._make_hit(
                     lat, lon, confidence,
+                    sigma_km=800.0,  # Country-level — currency visible
                     currency=currency,
                     country=cc,
                     raw_score=score,
+                    hint_level="country",
                 ))
 
         return hits

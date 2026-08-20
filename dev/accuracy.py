@@ -71,8 +71,19 @@ class AccuracyTracker:
     """Collects and computes accuracy metrics across all test images."""
 
     results: list[ImageResult] = field(default_factory=list)
+    is_no_exif: bool = False
+
+    # With-EXIF targets
     target_accuracy_100m: float = 0.50  # 50% target within 100m
-    target_accuracy_1km: float = 0.75  # 75% target within 1km
+    target_accuracy_1km: float = 0.75   # 75% target within 1km
+    # Without-EXIF targets (wider thresholds)
+    target_accuracy_10km: float = 0.20  # 20% target within 10km
+    target_accuracy_100km: float = 0.50 # 50% target within 100km
+
+    def __post_init__(self) -> None:
+        if self.is_no_exif:
+            self.target_accuracy_100m = 0.05
+            self.target_accuracy_1km = 0.10
 
     def record(
         self,
@@ -329,8 +340,13 @@ class AccuracyTracker:
             "exact_gps_count": exact_gps_count,
             "target_accuracy_100m": self.target_accuracy_100m,
             "target_accuracy_1km": self.target_accuracy_1km,
+            "target_accuracy_10km": self.target_accuracy_10km,
+            "target_accuracy_100km": self.target_accuracy_100km,
             "meets_100m_target": (passed_100m / total) >= self.target_accuracy_100m if total else False,
             "meets_1km_target": (passed_1km / total) >= self.target_accuracy_1km if total else False,
+            "meets_10km_target": (passed_10km / total) >= self.target_accuracy_10km if total else False,
+            "meets_100km_target": (passed_100km / total) >= self.target_accuracy_100km if total else False,
+            "is_no_exif": self.is_no_exif,
         }
 
     def detailed_report(self) -> str:
@@ -342,6 +358,8 @@ class AccuracyTracker:
         lines: list[str] = []
         lines.append("=" * 72)
         lines.append("           GEOFIND ACCURACY REPORT")
+        if self.is_no_exif:
+            lines.append("           (EXIF GPS DISABLED)")
         lines.append("=" * 72)
         lines.append("")
 
@@ -366,6 +384,11 @@ class AccuracyTracker:
         m1k = "PASS" if s["meets_1km_target"] else "FAIL"
         lines.append(f"  100m target ({s['target_accuracy_100m']:.0%}): [{m100}]")
         lines.append(f"   1km target ({s['target_accuracy_1km']:.0%}): [{m1k}]")
+        if self.is_no_exif:
+            m10k = "PASS" if s["meets_10km_target"] else "FAIL"
+            m100k = "PASS" if s["meets_100km_target"] else "FAIL"
+            lines.append(f"  10km target ({s['target_accuracy_10km']:.0%}): [{m10k}]")
+            lines.append(f" 100km target ({s['target_accuracy_100km']:.0%}): [{m100k}]")
         lines.append("")
 
         # Near misses

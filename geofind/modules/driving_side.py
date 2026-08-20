@@ -118,6 +118,7 @@ class DrivingSideModule(BaseModule):
             lat, lon = _COUNTRY_CENTROIDS.get(cc, (0.0, 0.0))
             hits.append(self._make_hit(
                 lat, lon, confidence / n,
+                sigma_km=800.0,  # Country-level — wide spread
                 country=cc,
                 driving_side=driving_side,
                 vehicle_count=len(vehicles),

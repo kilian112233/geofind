@@ -52,7 +52,7 @@ class LicensePlateModule(BaseModule):
             return easyocr.Reader(["en"], gpu=False)
 
         self._yolo_model = get_cached_model("yolo_plate", _load_yolo)
-        self._ocr_reader = get_cached_model("easyocr_plate", _load_ocr)
+        self._ocr_reader = get_cached_model("easyocr", _load_ocr)
         super().prepare()
 
     def detect(
@@ -119,6 +119,7 @@ class LicensePlateModule(BaseModule):
                 lat, lon = _COUNTRY_CENTROIDS.get(cc, (0.0, 0.0))
                 hits.append(self._make_hit(
                     lat, lon, confidence,
+                    sigma_km=600.0,  # Country-level — plate pattern matches a country
                     country=cc,
                     plate_text=plate_text,
                 ))

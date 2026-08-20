@@ -46,6 +46,7 @@ class BaseModule(abc.ABC):
         lat: float,
         lon: float,
         confidence: float,
+        sigma_km: float | None = None,
         **metadata: Any,
     ) -> ModuleHit:
         return ModuleHit(
@@ -53,6 +54,7 @@ class BaseModule(abc.ABC):
             lat=lat,
             lon=lon,
             confidence=confidence,
+            sigma_km=sigma_km,
             metadata=metadata,
         )
 

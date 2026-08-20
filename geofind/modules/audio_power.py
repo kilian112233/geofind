@@ -81,9 +81,11 @@ class AudioPowerModule(BaseModule):
             lat, lon = _COUNTRY_CENTROIDS.get(cc, (0.0, 0.0))
             hits.append(self._make_hit(
                 lat, lon, confidence / n,
+                sigma_km=800.0,  # Country-level — power grid frequency
                 country=cc,
                 frequency_hz=detected_hz,
                 peak_freq=peak_freq,
+                hint_level="country",
             ))
 
         return hits

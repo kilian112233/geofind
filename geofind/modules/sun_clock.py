@@ -38,7 +38,7 @@ class SunClockModule(BaseModule):
             def _load():
                 return easyocr.Reader(["en"], gpu=False)
 
-            self._ocr_reader = get_cached_model("easyocr_en", _load)
+            self._ocr_reader = get_cached_model("easyocr", _load)
         except ImportError:
             self._log("easyocr not available for clock reading", logging.INFO)
 

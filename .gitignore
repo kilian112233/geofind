@@ -29,3 +29,10 @@ desktop.ini
 # Test artifacts
 test_output/
 dev/test_images/
+dev/cached_random_images.json
+dev/test_results.json
+dev/test_results.txt
+test_images/
+yolov8n.pt
+*.gguf
+docs/EVAL_OVERVIEW.md

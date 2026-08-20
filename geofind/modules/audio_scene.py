@@ -126,9 +126,11 @@ class AudioSceneModule(BaseModule):
 
             hits.append(self._make_hit(
                 prior["lat"], prior["lon"], confidence,
+                sigma_km=600.0,  # Region-level — audio scenes are vague
                 scene=scene,
                 raw_score=score,
                 hint=prior["hint"],
+                hint_level="region",
             ))
 
         return hits

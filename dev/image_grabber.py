@@ -28,6 +28,8 @@ logger = logging.getLogger("image_grabber")
 
 DATASET_PATH = Path("W:/geofind/dev/test_dataset.json")
 IMAGES_DIR = Path("W:/geofind/dev/test_images")
+RANDOM_CACHE_PATH = Path("W:/geofind/dev/cached_random_images.json")
+USER_AGENT = "geofind-test-suite/1.0 (https://github.com/geofind; geofind-dev)"
 
 
 def load_dataset(path: Path = DATASET_PATH) -> dict[str, Any]:
@@ -40,10 +42,14 @@ def download_image(
     url: str,
     dest: Path,
     timeout: int = 30,
-    retries: int = 2,
+    retries: int = 5,
     user_agent: str = "geofind-test-suite/1.0",
 ) -> bool:
-    """Download a single image with retries. Returns True on success."""
+    """Download a single image with retries and rate-limit handling.
+
+    Detects HTTP 429 responses and respects Retry-After headers.
+    Returns True on success.
+    """
     import requests  # lazy import
 
     if dest.exists() and dest.stat().st_size > 1024:
@@ -59,6 +65,33 @@ def download_image(
                 headers={"User-Agent": user_agent},
                 stream=True,
             )
+
+            # 404 is permanent — fail immediately, no retry
+            if resp.status_code == 404:
+                logger.warning(f"  404 Not Found: {url[:80]}...")
+                return False
+
+            # Handle rate limiting (429) with Retry-After header
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait = int(retry_after)
+                    except ValueError:
+                        wait = 30
+                else:
+                    wait = min(30 * attempt, 120)
+                logger.warning(f"  Rate limited (429). Waiting {wait}s before retry...")
+                time.sleep(wait)
+                continue
+
+            # Handle other server errors that may indicate rate limiting (503, 500)
+            if resp.status_code in (503, 500) and attempt < retries:
+                wait = min(10 * attempt, 60)
+                logger.warning(f"  Server error ({resp.status_code}). Waiting {wait}s...")
+                time.sleep(wait)
+                continue
+
             resp.raise_for_status()
 
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -78,7 +111,8 @@ def download_image(
         except requests.exceptions.RequestException as e:
             logger.warning(f"  Attempt {attempt} failed: {e}")
             if attempt < retries:
-                time.sleep(1.5 * attempt)
+                wait = min(5 * attempt, 30)
+                time.sleep(wait)
 
         except Exception as e:
             logger.error(f"  Unexpected error: {e}")
@@ -121,8 +155,392 @@ def download_all(dataset: dict[str, Any], force: bool = False) -> dict[str, bool
             failed += 1
         print(f"  [{i}/{total}] {tid}: {'OK' if ok else 'FAILED'}")
 
+        # Brief pause between downloads to avoid rate limiting
+        if i < total:
+            time.sleep(0.5)
+
     print(f"\nDone: {success} downloaded, {failed} failed out of {total}")
     return results
+
+
+def fetch_random_geotagged_images(
+    count: int = 20,
+    cache_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch random geotagged images from Wikimedia Commons via Wikidata SPARQL.
+
+    Queries Wikidata for items that are photographs/images with a coordinate
+    location (P625), extracts their Commons image URLs and coordinates, then
+    returns them as a list of dicts.
+
+    Results are cached to ``W:/geofind/dev/cached_random_images.json``.
+
+    Returns:
+        List of dicts with keys: id, title, url, lat, lon, name.
+    """
+    import requests  # lazy import
+
+    if cache_path is None:
+        cache_path = RANDOM_CACHE_PATH
+
+    # Check cache first
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if len(cached) >= count:
+                logger.info(f"Using {count} cached random images from {cache_path}")
+                return cached[:count]
+            logger.info(f"Cache has {len(cached)} images, need {count} — fetching more")
+        except (json.JSONDecodeError, KeyError):
+            logger.warning("Corrupt cache file, will re-fetch")
+
+    # Multiple SPARQL queries targeting different types of geotagged content.
+    # Using different Wikidata classes ensures diversity across regions and
+    # subject matter rather than always returning the same ~5 photographs.
+    sparql_queries: list[tuple[str, str]] = [
+        (
+            "photographs",
+            """
+SELECT ?item ?itemLabel ?lat ?lon ?image WHERE {
+  ?item wdt:P31/wdt:P279* wd:Q125191 .
+  ?item p:P625 ?coordStatement .
+  ?coordStatement psv:P625 ?coord .
+  ?coord wikibase:geoLatitude ?lat .
+  ?coord wikibase:geoLongitude ?lon .
+  ?item wdt:P18 ?image .
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . }
+} LIMIT 500
+""",
+        ),
+        (
+            "buildings",
+            """
+SELECT ?item ?itemLabel ?lat ?lon ?image WHERE {
+  ?item wdt:P31/wdt:P279* wd:Q811979 .
+  ?item p:P625 ?coordStatement .
+  ?coordStatement psv:P625 ?coord .
+  ?coord wikibase:geoLatitude ?lat .
+  ?coord wikibase:geoLongitude ?lon .
+  ?item wdt:P18 ?image .
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . }
+} LIMIT 500
+""",
+        ),
+        (
+            "cities",
+            """
+SELECT ?item ?itemLabel ?lat ?lon ?image WHERE {
+  ?item wdt:P31/wdt:P279* wd:Q515 .
+  ?item p:P625 ?coordStatement .
+  ?coordStatement psv:P625 ?coord .
+  ?coord wikibase:geoLatitude ?lat .
+  ?coord wikibase:geoLongitude ?lon .
+  ?item wdt:P18 ?image .
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . }
+} LIMIT 500
+""",
+        ),
+    ]
+
+    results: list[dict[str, Any]] = []
+    seen_item_ids: set[str] = set()  # deduplicate by Wikidata item ID
+
+    for query_idx, (query_type, sparql) in enumerate(sparql_queries):
+        try:
+            logger.info(
+                f"Querying Wikidata SPARQL for geotagged images "
+                f"({query_type}, query {query_idx + 1}/{len(sparql_queries)})..."
+            )
+
+            resp = None
+            for sparql_attempt in range(1, 4):
+                resp = requests.get(
+                    "https://query.wikidata.org/sparql",
+                    params={"query": sparql, "format": "json"},
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Accept": "application/sparql-results+json",
+                    },
+                    timeout=30,
+                )
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    wait = int(retry_after) if retry_after else 30
+                    logger.warning(
+                        f"SPARQL rate limited ({query_type}). Waiting {wait}s..."
+                    )
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                break
+
+            if resp is None:
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+
+            bindings = data.get("results", {}).get("bindings", [])
+            logger.info(
+                f"SPARQL ({query_type}) returned {len(bindings)} results"
+            )
+
+            for i, row in enumerate(bindings):
+                try:
+                    item_uri = row["item"]["value"]
+                    item_id = item_uri.split("/")[-1]
+
+                    # Skip duplicates across queries
+                    if item_id in seen_item_ids:
+                        continue
+                    seen_item_ids.add(item_id)
+
+                    title = row.get("itemLabel", {}).get("value", item_id)
+                    lat = float(row["lat"]["value"])
+                    lon = float(row["lon"]["value"])
+                    image_value = row["image"]["value"]
+
+                    # The SPARQL image field can be a full URL or just a filename
+                    # Extract the actual filename for the redirect URL
+                    if "Special:FilePath/" in image_value:
+                        # Full URL: http://commons.wikimedia.org/wiki/Special:FilePath/Foo.jpg
+                        # Extract just the filename after Special:FilePath/
+                        filename = image_value.split("Special:FilePath/")[-1]
+                        # Remove any query params
+                        filename = filename.split("?")[0]
+                        encoded_title = filename.replace(" ", "_")
+                    elif image_value.startswith("http"):
+                        # Some other full URL format — just use it directly
+                        url = (
+                            f"{image_value}&width=1200"
+                            if "?" in image_value
+                            else f"{image_value}?width=1200"
+                        )
+                        encoded_title = None  # skip URL construction below
+                    else:
+                        # Just a plain filename
+                        encoded_title = image_value.replace(" ", "_")
+
+                    if encoded_title is not None:
+                        url = (
+                            f"https://commons.wikimedia.org/w/index.php"
+                            f"?title=Special:Redirect/file/{encoded_title}"
+                            f"&width=1200"
+                        )
+
+                    # Make a safe filename from the item id
+                    safe_id = item_id.replace("Q", "q")
+
+                    results.append({
+                        "id": f"wiki_{safe_id}",
+                        "title": title,
+                        "url": url,
+                        "lat": lat,
+                        "lon": lon,
+                        "name": title,
+                        "query_type": query_type,
+                    })
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.debug(f"Skipping row {i} ({query_type}): {e}")
+                    continue
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"SPARQL query failed ({query_type}): {e}")
+        except Exception as e:
+            logger.error(
+                f"Unexpected error during SPARQL fetch ({query_type}): {e}"
+            )
+
+        # Delay between queries to respect Wikidata rate limits
+        if query_idx < len(sparql_queries) - 1:
+            time.sleep(1.0)
+
+    logger.info(
+        f"Collected {len(results)} usable geotagged images "
+        f"from {len(sparql_queries)} queries"
+    )
+
+    # If SPARQL didn't return enough, try the Commons geosearch API as fallback
+    if len(results) < count:
+        logger.info("Falling back to Wikimedia Commons geosearch API...")
+        results.extend(_commons_geosearch_fallback(count - len(results), existing_ids={r["id"] for r in results}))
+
+    # Shuffle so each call gets different images (SPARQL returns deterministic order)
+    import random
+    random.shuffle(results)
+
+    # Cache the combined results
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        logger.info(f"Cached {len(results)} random images to {cache_path}")
+    except OSError as e:
+        logger.warning(f"Failed to write cache: {e}")
+
+    return results[:count]
+
+
+def _commons_geosearch_fallback(
+    count: int,
+    existing_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Fallback: use Wikimedia Commons geosearch API for random locations.
+
+    Picks random points on land and searches for nearby images on Commons.
+    """
+    import random
+    import requests  # lazy import
+
+    if existing_ids is None:
+        existing_ids = set()
+
+    results: list[dict[str, Any]] = []
+    rng = random.Random()
+
+    # Random land locations (rough centroids of continents)
+    search_points = [
+        (40.0, -74.0),   # NYC area
+        (48.85, 2.35),    # Paris
+        (-33.87, 151.21), # Sydney
+        (35.68, 139.69),  # Tokyo
+        (-22.91, -43.17), # Rio
+        (51.51, -0.13),   # London
+        (41.90, 12.50),   # Rome
+        (52.52, 13.41),   # Berlin
+        (19.07, 72.88),   # Mumbai
+        (55.75, 37.62),   # Moscow
+        (59.33, 18.07),   # Stockholm
+        (37.98, 23.73),   # Athens
+        (49.28, -123.12), # Vancouver
+        (-34.60, -58.38), # Buenos Aires
+        (30.04, 31.24),   # Cairo
+    ]
+    rng.shuffle(search_points)
+
+    for lat, lon in search_points:
+        if len(results) >= count:
+            break
+
+        try:
+            resp = requests.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params={
+                    "action": "query",
+                    "generator": "geosearch",
+                    "ggsprimary": "file",
+                    "ggsnamespace": 6,
+                    "ggscoord": f"{lat}|{lon}",
+                    "ggsradius": 100000,
+                    "ggslimit": 10,
+                    "prop": "imageinfo",
+                    "iiprop": "url|extmetadata",
+                    "iiurlwidth": 1200,
+                    "format": "json",
+                },
+                headers={"User-Agent": USER_AGENT},
+                timeout=20,
+            )
+
+            # Handle rate limiting
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                wait = int(retry_after) if retry_after else 30
+                logger.warning(f"Geosearch rate limited. Waiting {wait}s...")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            pages = data.get("query", {}).get("pages", {})
+            for page_id, page in pages.items():
+                if len(results) >= count:
+                    break
+
+                title = page.get("title", "")
+                imageinfo = page.get("imageinfo", [{}])[0]
+                thumb_url = imageinfo.get("thumburl", "")
+                img_url = imageinfo.get("url", "")
+
+                # Use the actual image URL (not thumbnail) for analysis
+                url = img_url or thumb_url
+                if not url:
+                    continue
+
+                # Try to extract coords from extmetadata
+                ext = imageinfo.get("extmetadata", {})
+                gps_lat = ext.get("GPSLatitude", {}).get("value")
+                gps_lon = ext.get("GPSLongitude", {}).get("value")
+
+                if gps_lat and gps_lon:
+                    try:
+                        flat = float(gps_lat)
+                        flon = float(gps_lon)
+                    except (ValueError, TypeError):
+                        flat, flon = lat, lon
+                else:
+                    flat, flon = lat, lon
+
+                # Create a filename-safe ID
+                safe_title = title.replace("File:", "").replace(" ", "_")[:60]
+                fid = f"commons_{hashlib.md5(title.encode()).hexdigest()[:12]}"
+
+                if fid in existing_ids:
+                    continue
+                existing_ids.add(fid)
+
+                results.append({
+                    "id": fid,
+                    "title": safe_title,
+                    "url": url,
+                    "lat": flat,
+                    "lon": flon,
+                    "name": safe_title.replace("_", " "),
+                })
+
+            time.sleep(2.0)  # Rate limit
+
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"Geosearch failed for ({lat}, {lon}): {e}")
+            continue
+        except Exception as e:
+            logger.debug(f"Error processing geosearch result: {e}")
+            continue
+
+    return results
+
+
+def strip_exif_gps(image_path: Path, output_path: Path | None = None) -> Path:
+    """Remove ALL EXIF data (especially GPS) from an image.
+
+    Opens the image with Pillow, removes EXIF, and saves to output_path.
+    If output_path is None, overwrites the original in-place.
+
+    Args:
+        image_path: Path to the source image.
+        output_path: Where to save the stripped image. None = overwrite.
+
+    Returns:
+        Path to the stripped image.
+    """
+    from PIL import Image
+
+    if output_path is None:
+        output_path = image_path
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    img = Image.open(image_path)
+
+    # Save without any EXIF data — Pillow strips EXIF when no exif= arg is given
+    data = list(img.getdata())
+    clean = Image.new(img.mode, img.size)
+    clean.putdata(data)
+    clean.save(output_path, "JPEG", quality=95)
+
+    logger.info(f"Stripped EXIF: {image_path.name} -> {output_path.name}")
+    return output_path
 
 
 def generate_synthetic_image(

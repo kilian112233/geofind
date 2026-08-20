@@ -9,6 +9,10 @@ Usage:
     python dev/run_tests.py --synthetic         # Use synthetic EXIF images
     python dev/run_tests.py --limit 5 --verbose # Quick smoke test
     python dev/run_tests.py --modules exif      # Test specific modules only
+    python dev/run_tests.py --no-exif           # Test without EXIF GPS (visual-only)
+    python dev/run_tests.py --random            # Use random Wikimedia images
+    python dev/run_tests.py --random --no-exif  # Random images, no EXIF
+    python dev/run_tests.py --sample 10         # Randomly sample 10 test cases
 """
 
 from __future__ import annotations
@@ -37,6 +41,8 @@ from image_grabber import (
     load_dataset,
     generate_synthetic_batch,
     download_all,
+    fetch_random_geotagged_images,
+    strip_exif_gps,
     SYNTHETIC_LOCATIONS,
 )
 
@@ -105,50 +111,105 @@ def run_all_tests(
     limit: int | None = None,
     output_path: Path | None = None,
     verbose: bool = False,
+    no_exif: bool = False,
+    random_mode: bool = False,
+    sample_count: int | None = None,
 ) -> AccuracyTracker:
     """Run the full test suite and return accuracy results."""
 
     # ── Load dataset ─────────────────────────────────────────────────────
     _rich_print("\n[bold cyan]=== geofind Test Runner ===[/]")
-    _rich_print(f"Dataset: {dataset_path}")
 
-    # When using synthetic mode, create a matching synthetic dataset
-    if use_synthetic:
+    if random_mode:
+        _rich_print("[bold magenta]Mode: Random geotagged images from Wikimedia[/]")
+        n = limit or 20
+        random_images = fetch_random_geotagged_images(count=n)
+        if not random_images:
+            _rich_print("[red]Failed to fetch any random images. Aborting.[/]")
+            return AccuracyTracker()
+
+        # Build a synthetic dataset dict from fetched images
+        dataset = {
+            "version": "1.0",
+            "description": f"Random geotagged images ({len(random_images)} items)",
+            "test_cases": [
+                {
+                    "id": img["id"],
+                    "name": img["name"],
+                    "expected_lat": img["lat"],
+                    "expected_lon": img["lon"],
+                    "category": "random",
+                    "continent": "unknown",
+                    "image_url": img["url"],
+                    "has_exif_gps": False,
+                    "difficulty": "random",
+                }
+                for img in random_images
+            ],
+        }
+        image_dir = IMAGES_DIR
+        image_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download the random images
+        _rich_print(f"  Downloading {len(random_images)} random images...")
+        dl_results = download_all(dataset, force=False)
+        ok_count = sum(1 for v in dl_results.values() if v)
+        _rich_print(f"  Downloaded: [green]{ok_count}[/] / {len(random_images)}")
+
+    elif use_synthetic:
         from image_grabber import create_synthetic_dataset
         dataset = create_synthetic_dataset()
-        # Override image directory to synthetic folder
         image_dir = IMAGES_DIR / "synthetic"
     else:
+        _rich_print(f"Dataset: {dataset_path}")
         dataset = load_dataset(dataset_path)
         image_dir = IMAGES_DIR
 
     cases = dataset["test_cases"]
-    if limit:
+    if limit and not random_mode:
         cases = cases[:limit]
+
+    # ── Sample N random test cases ──────────────────────────────────────
+    if sample_count is not None and sample_count > 0:
+        import random as _random
+        cases = _random.sample(cases, min(sample_count, len(cases)))
+        _rich_print(f"  Sampled [bold]{len(cases)}[/] random test cases")
+
     total = len(cases)
     _rich_print(f"Test cases: [bold]{total}[/]")
 
     # ── Prepare images ───────────────────────────────────────────────────
     if use_synthetic:
         _rich_print("\n[bold yellow]Mode: Synthetic EXIF images[/]")
-        # image_dir already set above for synthetic mode
         generate_synthetic_batch(output_dir=image_dir)
-    else:
+    elif not random_mode:
         _rich_print("\n[bold yellow]Mode: Download from Wikimedia[/]")
         image_dir = IMAGES_DIR
-        # Check which images we already have
         existing = 0
         for tc in cases:
             if (image_dir / f"{tc['id']}.jpg").exists():
                 existing += 1
         _rich_print(f"  Cached: {existing}/{total}")
-
         if existing < total:
             _rich_print("  Downloading missing images...")
             download_all(dataset, force=False)
 
+    # ── No-EXIF mode: strip GPS from images ─────────────────────────────
+    no_exif_temp_dir: Path | None = None
+    if no_exif:
+        import tempfile
+        no_exif_temp_dir = Path(tempfile.mkdtemp(prefix="geofind_noexif_"))
+        _rich_print(f"\n[bold magenta]Mode: NO EXIF GPS[/]")
+        _rich_print(f"  Stripping EXIF to temp dir: {no_exif_temp_dir}")
+
     # ── Configure pipeline ───────────────────────────────────────────────
     config = PipelineConfig()
+
+    # Disable EXIF module if --no-exif
+    if no_exif and "exif" in config.modules:
+        config.modules["exif"].enabled = False
+        _rich_print("  [red]EXIF module disabled[/]")
+
     if modules:
         mod_list = [m.strip() for m in modules.split(",")]
         for name in config.modules:
@@ -159,11 +220,21 @@ def run_all_tests(
         _rich_print(f"Modules: [bold]{', '.join(enabled)}[/]")
 
     # ── Run tests ────────────────────────────────────────────────────────
-    tracker = AccuracyTracker()
+    tracker = AccuracyTracker(is_no_exif=no_exif)
     passed = 0
     failed = 0
     errors = 0
     start_time = time.perf_counter()
+
+    def _get_image_path(tc: dict[str, Any]) -> Path:
+        """Get the image path, stripping EXIF if needed."""
+        base = image_dir / f"{tc['id']}.jpg"
+        if no_exif and no_exif_temp_dir is not None and base.exists():
+            stripped = no_exif_temp_dir / f"{tc['id']}.jpg"
+            if not stripped.exists():
+                strip_exif_gps(base, stripped)
+            return stripped
+        return base
 
     if HAS_RICH:
         with Progress(
@@ -178,11 +249,10 @@ def run_all_tests(
 
             for i, tc in enumerate(cases):
                 tid = tc["id"]
-                image_path = image_dir / f"{tid}.jpg"
+                image_path = _get_image_path(tc)
 
                 progress.update(task, description=f"[cyan]{tid}[/]")
 
-                # Check image exists
                 if not image_path.exists():
                     progress.update(task, description=f"[red]{tid} (no image)[/]")
                     tracker.record_error(
@@ -194,7 +264,6 @@ def run_all_tests(
                     progress.advance(task)
                     continue
 
-                # Run pipeline
                 try:
                     result = run_pipeline(image_path, modules=modules, config=config)
                     ir = tracker.record(
@@ -205,12 +274,20 @@ def run_all_tests(
                         meta=tc,
                     )
 
-                    if ir.within_1km:
-                        progress.update(task, description=f"[green]{tid} ✓[/]")
-                        passed += 1
+                    if no_exif:
+                        if ir.within_10km:
+                            progress.update(task, description=f"[green]{tid} ✓ ({ir.distance_error_km:.1f}km)[/]")
+                            passed += 1
+                        else:
+                            progress.update(task, description=f"[yellow]{tid} ({ir.distance_error_km:.1f}km)[/]")
+                            failed += 1
                     else:
-                        progress.update(task, description=f"[yellow]{tid} ({ir.distance_error_km:.1f}km)[/]")
-                        failed += 1
+                        if ir.within_1km:
+                            progress.update(task, description=f"[green]{tid} ✓[/]")
+                            passed += 1
+                        else:
+                            progress.update(task, description=f"[yellow]{tid} ({ir.distance_error_km:.1f}km)[/]")
+                            failed += 1
 
                 except Exception as e:
                     progress.update(task, description=f"[red]{tid} (error)[/]")
@@ -223,7 +300,7 @@ def run_all_tests(
     else:
         for i, tc in enumerate(cases, 1):
             tid = tc["id"]
-            image_path = image_dir / f"{tid}.jpg"
+            image_path = _get_image_path(tc)
             print(f"  [{i}/{total}] {tid}...", end=" ", flush=True)
 
             if not image_path.exists():
@@ -241,7 +318,8 @@ def run_all_tests(
                     result=result,
                     meta=tc,
                 )
-                if ir.within_1km:
+                pass_threshold = ir.within_10km if no_exif else ir.within_1km
+                if pass_threshold:
                     passed += 1
                     print(f"OK ({ir.distance_error_km:.2f}km)")
                 else:
@@ -251,6 +329,15 @@ def run_all_tests(
                 tracker.record_error(tid, meta=tc, error_message=str(e))
                 errors += 1
                 print(f"ERROR: {e}")
+
+    # ── Cleanup temp dir ─────────────────────────────────────────────────
+    if no_exif_temp_dir is not None:
+        import shutil
+        try:
+            shutil.rmtree(no_exif_temp_dir, ignore_errors=True)
+            logger.info(f"Cleaned up temp dir: {no_exif_temp_dir}")
+        except Exception:
+            pass
 
     elapsed = time.perf_counter() - start_time
 
@@ -276,8 +363,9 @@ def run_all_tests(
             thresholds = [
                 ("100m", s["passed_100m"], s["total_tests"], s["accuracy_100m"], s["target_accuracy_100m"]),
                 ("1km", s["passed_1km"], s["total_tests"], s["accuracy_1km"], s["target_accuracy_1km"]),
-                ("10km", s["passed_10km"], s["total_tests"], s["accuracy_10km"], 0.90),
+                ("10km", s["passed_10km"], s["total_tests"], s["accuracy_10km"], s.get("target_accuracy_10km", 0.90)),
                 ("50km", s["passed_50km"], s["total_tests"], s["accuracy_50km"], 0.95),
+                ("100km", s["passed_100km"], s["total_tests"], s["accuracy_100km"], s.get("target_accuracy_100km", 0.95)),
             ]
 
             for name, passed_n, total_n, acc, target in thresholds:
@@ -398,6 +486,23 @@ def main() -> None:
         action="store_true",
         help="Verbose logging",
     )
+    parser.add_argument(
+        "--no-exif",
+        action="store_true",
+        help="Strip EXIF GPS data from images and disable EXIF module (tests visual-only accuracy)",
+    )
+    parser.add_argument(
+        "--random",
+        action="store_true",
+        help="Fetch random geotagged images from Wikimedia instead of using the dataset",
+    )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Randomly sample N test cases from the dataset",
+    )
     args = parser.parse_args()
 
     if args.verbose:
@@ -410,14 +515,21 @@ def main() -> None:
         limit=args.limit,
         output_path=args.output,
         verbose=args.verbose,
+        no_exif=args.no_exif,
+        random_mode=args.random,
+        sample_count=args.sample,
     )
 
     # Exit code based on accuracy
     s = tracker.summary()
-    if "error" not in s and s["meets_1km_target"]:
-        sys.exit(0)
-    else:
-        sys.exit(1)
+    if "error" not in s:
+        if tracker.is_no_exif:
+            # In no-exif mode, passing the 10km or 100km target is a success
+            if s.get("meets_10km_target") or s.get("meets_100km_target"):
+                sys.exit(0)
+        elif s["meets_1km_target"]:
+            sys.exit(0)
+    sys.exit(1)
 
 
 if __name__ == "__main__":

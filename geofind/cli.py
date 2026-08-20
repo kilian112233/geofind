@@ -184,6 +184,8 @@ def analyze(
     ),
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose output"),
     grid_resolution: float = typer.Option(1.0, "--resolution", help="Grid resolution in degrees"),
+    hierarchical: bool = typer.Option(True, "--hierarchical/--no-hierarchical", help="Enable hierarchical fine-grid refinement"),
+    fine_top_n: int = typer.Option(10, "--fine-top-n", help="Number of coarse candidates to refine on fine grid"),
 ):
     """Analyze media files to determine geographic origin."""
     try:
@@ -308,6 +310,7 @@ def modules():
 
     descriptions = {
         "exif": "EXIF/GPS metadata extraction",
+        "geoclip": "GeoCLIP pre-trained geo-vision model (4.7M images)",
         "clip_visual": "CLIP visual embedding similarity",
         "landmark": "Famous landmark detection",
         "ocr_text": "Text detection and OCR geolocation",
@@ -437,6 +440,164 @@ def info():
         console.print(f"[yellow]Could not check module availability: {e}[/]")
 
     console.print()
+
+
+@app.command()
+def evaluate(
+    source: str = typer.Option(
+        "wikimedia", "--source", "-s", help="Image source: wikimedia or local"
+    ),
+    count: int = typer.Option(25, "--count", "-n", help="Number of images to evaluate"),
+    output: Optional[Path] = typer.Option(
+        None, "-o", "--output", help="Output directory"
+    ),
+    modules: Optional[str] = typer.Option(
+        None, "--modules", "-m", help="Comma-separated modules to enable"
+    ),
+    disable_modules: Optional[str] = typer.Option(
+        None, "--disable", help="Comma-separated modules to disable"
+    ),
+    no_strip_exif: bool = typer.Option(
+        False, "--no-strip-exif", help="Keep EXIF GPS data in images"
+    ),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Verbose output"),
+):
+    """Evaluate geofind accuracy on random geotagged images.
+
+    Downloads random images from Wikimedia Commons, strips EXIF GPS,
+    runs the full pipeline, and measures distance error from ground truth.
+    """
+    try:
+        _print_header()
+
+        from geofind.eval.runner import EvalRunner
+
+        runner = EvalRunner(
+            output_dir=output,
+            modules=modules,
+            disable_modules=disable_modules,
+            verbose=verbose,
+        )
+
+        metrics = runner.evaluate(
+            source=source,
+            count=count,
+            strip_exif=not no_strip_exif,
+        )
+
+        s = metrics.summary()
+        if "error" in s:
+            console.print("[yellow]No results to evaluate[/]")
+            raise typer.Exit(1)
+
+        # Generate HTML report
+        from geofind.eval.report import generate_html_report
+        html_path = (output or Path("W:/geofind/output/eval")) / "eval_report.html"
+        generate_html_report({"baseline": metrics}, html_path, title="geofind Evaluation")
+        console.print(f"  HTML report: [cyan]{html_path}[/]")
+
+        # Exit code based on accuracy
+        if not no_strip_exif:
+            if s.get("accuracy_1km", 0) >= 0.10:
+                raise typer.Exit(0)
+        else:
+            if s.get("accuracy_100m", 0) >= 0.50:
+                raise typer.Exit(0)
+        raise typer.Exit(1)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted[/]")
+        raise typer.Exit(130)
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red]Error:[/] {e}")
+        if verbose:
+            console.print_exception()
+        raise typer.Exit(1)
+
+
+@app.command()
+def ablate(
+    source: str = typer.Option(
+        "wikimedia", "--source", "-s", help="Image source: wikimedia or local"
+    ),
+    count: int = typer.Option(25, "--count", "-n", help="Number of images per variant"),
+    output: Optional[Path] = typer.Option(
+        None, "-o", "--output", help="Output directory"
+    ),
+    variants: Optional[str] = typer.Option(
+        None, "--variants", "-v",
+        help="Comma-separated variant names (default: core variants)",
+    ),
+    all_variants: bool = typer.Option(
+        False, "--all", help="Run all available variants"
+    ),
+    no_strip_exif: bool = typer.Option(
+        False, "--no-strip-exif", help="Keep EXIF GPS data in images"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", help="Verbose output"),
+):
+    """Run an ablation study on pipeline components.
+
+    Tests multiple pipeline variants (e.g., no consensus buff, no fuzzy
+    calibration, equal weights) to measure the impact of each component
+    on geolocation accuracy.
+    """
+    try:
+        _print_header()
+
+        from geofind.eval.ablation import ALL_VARIANTS, CORE_VARIANTS
+        from geofind.eval.runner import EvalRunner
+
+        if variants:
+            variant_list = [v.strip() for v in variants.split(",")]
+        elif all_variants:
+            variant_list = list(ALL_VARIANTS.keys())
+        else:
+            variant_list = CORE_VARIANTS
+
+        # Validate
+        for v in variant_list:
+            if v not in ALL_VARIANTS:
+                console.print(f"[red]Unknown variant:[/] {v}")
+                console.print(f"  Available: {', '.join(sorted(ALL_VARIANTS.keys()))}")
+                raise typer.Exit(1)
+
+        runner = EvalRunner(
+            output_dir=output,
+            verbose=verbose,
+        )
+
+        results = runner.ablate(
+            source=source,
+            count=count,
+            strip_exif=not no_strip_exif,
+            variants=variant_list,
+        )
+
+        if not results:
+            console.print("[yellow]No results[/]")
+            raise typer.Exit(1)
+
+        # Generate HTML report
+        from geofind.eval.report import generate_html_report
+        html_path = (output or Path("W:/geofind/output/eval")) / "ablation_report.html"
+        generate_html_report(results, html_path, title="geofind Ablation Study")
+        console.print(f"  HTML report: [cyan]{html_path}[/]")
+
+        raise typer.Exit(0)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted[/]")
+        raise typer.Exit(130)
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red]Error:[/] {e}")
+        if verbose:
+            console.print_exception()
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ class ModuleHit:
     lat: float
     lon: float
     confidence: float  # 0.0–1.0
+    sigma_km: float | None = None  # Per-hit Gaussian spread; None = use module/grid default
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -26,6 +27,8 @@ class CandidateLocation:
     hits: list[ModuleHit] = field(default_factory=list)
     buff_multiplier: float = 1.0
     is_exact: bool = False  # True when coords are from a precision source (e.g. EXIF GPS)
+    is_fine_refined: bool = False  # True when coords come from hierarchical fine-grid pass
+    distance_to_truth_km: float | None = None  # Set during self-test for diagnostics
 
     @property
     def country_hint(self) -> str:
@@ -45,6 +48,8 @@ class GeoResult:
     modules_run: list[str] = field(default_factory=list)
     modules_failed: list[str] = field(default_factory=list)
     processing_time_s: float = 0.0
+    all_module_hits: dict[str, list[ModuleHit]] = field(default_factory=dict)
+    hierarchical_pass: bool = False  # True if hierarchical refinement ran
 
     @property
     def top_candidate(self) -> CandidateLocation | None:

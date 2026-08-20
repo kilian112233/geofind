@@ -30,19 +30,10 @@ class VegetationModule(BaseModule):
             return False
 
     def prepare(self) -> None:
-        from geofind.utils.models import get_cached_model, ensure_clip_model
+        from geofind.utils.models import get_clip_shared
         from geofind.utils.constants import BIOME_PROMPTS
 
-        model_name = ensure_clip_model()
-
-        def _load():
-            from transformers import CLIPProcessor, CLIPModel
-            model = CLIPModel.from_pretrained(model_name)
-            processor = CLIPProcessor.from_pretrained(model_name)
-            model.eval()
-            return model, processor
-
-        self._model, self._processor = get_cached_model("clip_vegetation", _load)
+        self._model, self._processor = get_clip_shared()
         self._biome_prompts = BIOME_PROMPTS
         super().prepare()
 
@@ -112,8 +103,10 @@ class VegetationModule(BaseModule):
             confidence = min(norm_score * 1.5, 0.85)
             hits.append(self._make_hit(
                 lat, lon, confidence,
+                sigma_km=500.0,  # Biome-level — wide spread
                 biome=biome,
                 raw_score=score,
+                hint_level="biome",
             ))
 
         return hits
