@@ -49,7 +49,7 @@ class GeoclipModule(BaseModule):
         def _load():
             from geoclip import GeoCLIP
             model = GeoCLIP()
-            # Precompute location-encoder features for the 100K GPS gallery.
+            # Precompute location-encoder features for the GPS gallery.
             # The stock predict() re-encodes all gallery coordinates through
             # 3 capsule networks on EVERY call even though they never change —
             # this precomputation turns ~12s/image into ~1s on CPU.
@@ -57,7 +57,36 @@ class GeoclipModule(BaseModule):
             import torch.nn.functional as F
             with torch.no_grad():
                 loc_feats = model.location_encoder(model.gps_gallery)
-                model._gallery_loc_feats = F.normalize(loc_feats, dim=1)
+                loc_feats = F.normalize(loc_feats, dim=1)
+
+                # ── Gallery augmentation with real settlements ──────────
+                # The stock 100K gallery is uniformly random points; appending
+                # real populated-place coordinates makes top-K predictions
+                # snap to actual towns instead of arbitrary grid locations.
+                try:
+                    from geofind.utils.city_database import CITY_DATABASE
+                    if CITY_DATABASE:
+                        city_coords = torch.tensor(
+                            [
+                                [info["lat"], info["lon"]]
+                                for info in CITY_DATABASE.values()
+                            ],
+                            dtype=model.gps_gallery.dtype,
+                        )
+                        model.gps_gallery = torch.cat(
+                            [model.gps_gallery, city_coords], dim=0
+                        )
+                        city_feats = model.location_encoder(city_coords)
+                        city_feats = F.normalize(city_feats, dim=1)
+                        loc_feats = torch.cat([loc_feats, city_feats], dim=0)
+                        logger.info(
+                            "GeoCLIP gallery augmented with %d city "
+                            "coordinates", len(city_coords)
+                        )
+                except Exception as e:
+                    logger.warning("Gallery augmentation failed: %s", e)
+
+                model._gallery_loc_feats = loc_feats
             return model
 
         self._model = get_cached_model("geoclip", _load)

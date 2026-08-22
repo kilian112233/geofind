@@ -86,13 +86,14 @@ def _default_module_configs() -> dict[str, ModuleConfig]:
     """
     return {
         "exif": ModuleConfig(name="exif", weight=5.0, optional=False),
-        "geoclip": ModuleConfig(name="geoclip", weight=2.0, optional=True),
-        "clip_visual": ModuleConfig(name="clip_visual", weight=3.0, optional=True),
+        "geoclip": ModuleConfig(name="geoclip", weight=5.0, optional=True),
+        "clip_visual": ModuleConfig(name="clip_visual", weight=1.5, optional=True),
         "clip_retrieval": ModuleConfig(name="clip_retrieval", weight=4.0, optional=True),
         "places365": ModuleConfig(name="places365", weight=1.5, optional=True),
         "landmark": ModuleConfig(name="landmark", weight=3.0, optional=True),
         "ocr_text": ModuleConfig(name="ocr_text", weight=2.5, optional=True),
         "text_geocoder": ModuleConfig(name="text_geocoder", weight=6.0, optional=True),
+        "streetclip": ModuleConfig(name="streetclip", weight=3.0, optional=True),
         "solar_geolocate": ModuleConfig(name="solar_geolocate", weight=2.0, optional=True),
         "terrain_match": ModuleConfig(name="terrain_match", weight=3.0, optional=True),
         "audio_power": ModuleConfig(name="audio_power", weight=0.5, optional=True),
@@ -105,5 +106,5 @@ def _default_module_configs() -> dict[str, ModuleConfig]:
         "license_plate": ModuleConfig(name="license_plate", weight=0.5, optional=True),
         "currency": ModuleConfig(name="currency", weight=0.3, optional=True),
         "audio_scene": ModuleConfig(name="audio_scene", weight=0.5, optional=True),
-        "region_voter": ModuleConfig(name="region_voter", weight=7.0, optional=True),
+        "region_voter": ModuleConfig(name="region_voter", weight=1.0, optional=True),
     }

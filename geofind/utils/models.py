@@ -248,6 +248,39 @@ def clear_clip_image_cache() -> None:
     _clip_image_cache.clear()
 
 
+def get_streetclip() -> tuple[Any, Any]:
+    """Get the StreetCLIP model+processor (geolocation-specialized CLIP).
+
+    StreetCLIP (geolocal/StreetCLIP, CC-BY-NC-4.0) is a CLIP ViT-L/14
+    fine-tuned on Street View imagery at 336px input. Zero-shot country/
+    region classification beats supervised geo-models on Im2GPS/YFCC.
+    """
+    return get_cached_model(
+        "streetclip",
+        lambda: _load_hf_clip("geolocal/StreetCLIP"),
+    )
+
+
+def _load_hf_clip(model_name: str) -> tuple[Any, Any]:
+    """Load any HF CLIP-compatible model + processor.
+
+    Prefers the local cache (avoids slow/hanging hub etag checks on repeat
+    loads); falls back to downloading when not cached yet.
+    """
+    from transformers import CLIPModel, CLIPProcessor
+
+    try:
+        model = CLIPModel.from_pretrained(model_name, local_files_only=True)
+        processor = CLIPProcessor.from_pretrained(
+            model_name, local_files_only=True
+        )
+    except Exception:
+        model = CLIPModel.from_pretrained(model_name)
+        processor = CLIPProcessor.from_pretrained(model_name)
+    model.eval()
+    return model, processor
+
+
 # ── Shared OCR cache ────────────────────────────────────────────────────────
 # Multiple modules need the same EasyOCR pass over the same frame. The full
 # preprocessing pipeline (CLAHE → denoise → sharpen → Otsu) plus inference is

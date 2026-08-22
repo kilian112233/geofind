@@ -110,16 +110,27 @@ class BayesianReranker:
         other_centroids = [(lat, lon, w, n) for lat, lon, w, n in module_centroids if n != "geoclip"]
 
         # Check if GeoCLIP has tight clusters by looking at its hit distribution
+        # (median pairwise distance — robust to a single outlier hit)
         geoclip_hits = all_hits.get("geoclip", [])
         geoclip_is_tight = False
         if geoclip_hits and len(geoclip_hits) >= 3:
-            gc_lats = [h.lat for h in geoclip_hits[:5]]
-            gc_lons = [h.lon for h in geoclip_hits[:5]]
-            gc_spread = max(
-                _hav_km(min(gc_lats), min(gc_lons), max(gc_lats), max(gc_lons)),
-                _hav_km(min(gc_lats), max(gc_lons), max(gc_lats), min(gc_lons)),
-            )
-            geoclip_is_tight = gc_spread < 200  # tight cluster = <200km spread
+            pts = [(h.lat, h.lon) for h in geoclip_hits[:5]]
+            dists = [
+                _hav_km(pts[i][0], pts[i][1], pts[j][0], pts[j][1])
+                for i in range(len(pts))
+                for j in range(i + 1, len(pts))
+            ]
+            dists.sort()
+            median_d = dists[len(dists) // 2]
+            geoclip_is_tight = median_d < 250  # median pairwise distance < 250km
+
+        # High-confidence GeoCLIP top hit is trustworthy even without a
+        # perfectly tight cluster — confidence >= 0.5 means the model has
+        # a dominant peak.
+        gc_top_conf = max(
+            (h.confidence for h in geoclip_hits), default=0.0
+        )
+        geoclip_is_confident = gc_top_conf >= 0.5
 
         if geoclip_centroids and other_centroids:
             ow_sum = sum(w for _, _, w, _ in other_centroids)
@@ -128,17 +139,18 @@ class BayesianReranker:
                 other_lon = sum(lo * w for _, lo, w, _ in other_centroids) / ow_sum
                 gc_lat, gc_lon, gc_w, _ = geoclip_centroids[0]
                 gc_dist = _hav_km(gc_lat, gc_lon, other_lat, other_lon)
-                if gc_dist > 500 and not geoclip_is_tight:
-                    # Only reduce when GeoCLIP is uncertain/spread
-                    old_w = adjusted_weights.get("geoclip", 3.0)
-                    adjusted_weights["geoclip"] = old_w * 0.5
+                if gc_dist > 500 and not (geoclip_is_tight or geoclip_is_confident):
+                    # Only reduce when GeoCLIP is uncertain/spread AND unsure
+                    old_w = adjusted_weights.get("geoclip", 5.0)
+                    adjusted_weights["geoclip"] = old_w * 0.6
                     logger.info(
                         f"[reranker] GeoCLIP {gc_dist:.0f}km from module consensus (spread) — "
                         f"reducing weight {old_w:.1f}→{adjusted_weights['geoclip']:.1f}"
                     )
-                elif gc_dist > 500 and geoclip_is_tight:
+                elif gc_dist > 500 and (geoclip_is_tight or geoclip_is_confident):
                     logger.info(
-                        f"[reranker] GeoCLIP {gc_dist:.0f}km from module consensus (tight cluster) — "
+                        f"[reranker] GeoCLIP {gc_dist:.0f}km from module consensus "
+                        f"(tight={geoclip_is_tight}, conf={gc_top_conf:.2f}) — "
                         f"keeping weight (high confidence)"
                     )
 
@@ -155,7 +167,7 @@ class BayesianReranker:
         # Check if GeoCLIP has tight clusters (high confidence)
         geoclip_anchor = None
         geoclip_centroids_list = [(lat, lon, w) for lat, lon, w, n in module_centroids if n == "geoclip"]
-        if geoclip_centroids_list and geoclip_is_tight:
+        if geoclip_centroids_list and (geoclip_is_tight or geoclip_is_confident):
             geoclip_anchor = geoclip_centroids_list[0]
 
         rv_centroids = [(lat, lon, w) for lat, lon, w, n in module_centroids if n == "region_voter"]
@@ -321,20 +333,22 @@ class BayesianReranker:
         for i, candidate in enumerate(candidates):
             dist = float(dists_to_centroid[i])
 
-            # Progressive distance penalty
-            if dist > 500:
-                # Moderate penalty for far-away candidates (not too steep)
-                penalty = math.exp(-(dist / 600.0) ** 2 / 4.0)
-                candidate.probability *= max(0.05, penalty)
+            # Progressive distance penalty (steeper — wrong-side-of-continent
+            # candidates should not survive calibration)
+            if dist > 400:
+                penalty = math.exp(-(dist / 350.0) ** 2 / 4.0)
+                candidate.probability *= max(0.10, penalty)
 
-            # Strong bonus for multi-module agreement at this candidate
-            n_hits = len(candidate.hits)
+            # Multi-module agreement bonus — count DISTINCT modules, and cap
+            # the bonus so many hits from one noisy module can't fake consensus
+            hit_modules = {h.module for h in candidate.hits}
+            n_hits = len(hit_modules)
             if n_hits >= 4:
-                candidate.probability *= 2.0
+                candidate.probability *= 1.6
             elif n_hits >= 3:
-                candidate.probability *= 1.5
+                candidate.probability *= 1.35
             elif n_hits >= 2:
-                candidate.probability *= 1.3
+                candidate.probability *= 1.2
 
             # Region-aware bonus: count area-level modules agreeing
             area_modules = {"ocr_text", "driving_side", "vegetation", "currency",

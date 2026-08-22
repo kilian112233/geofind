@@ -45,8 +45,9 @@ _MODULE_CLASS_MAP: dict[str, str] = {
     "currency": "CurrencyModule",
     "audio_scene": "AudioSceneModule",
     "places365": "Places365Module",
-    "region_voter": "RegionVoterModule",
+
     "text_geocoder": "TextGeocoderModule",
+    "streetclip": "StreetclipModule",
     "solar_geolocate": "SolarGeolocateModule",
     "terrain_match": "TerrainMatchModule",
 }
@@ -57,7 +58,7 @@ _VISUAL_MODULES = {
     "sun_clock", "shadow_angle",
     "driving_side", "vegetation", "license_plate", "currency",
     "clip_retrieval", "places365", "region_voter",
-    "text_geocoder", "solar_geolocate", "terrain_match",
+    "text_geocoder", "streetclip", "solar_geolocate", "terrain_match",
 }
 
 # Modules that only work on audio data
@@ -193,6 +194,13 @@ class GeoPipeline:
                 )
         except Exception as e:
             logger.debug(f"Region voter failed: {e}")
+
+        # ── Country-prior fusion: StreetCLIP posterior × GeoCLIP ──────
+        # StreetCLIP is a geolocation-specialized classifier: when it is
+        # confident about the country, GeoCLIP hits in impossible countries
+        # get down-weighted and hits in plausible countries get boosted.
+        # Soft multiplicative fusion — never a hard veto.
+        self._fuse_country_prior(all_hits)
 
         # ── Build heatmap ────────────────────────────────────────────────
         if progress_callback:
@@ -470,6 +478,10 @@ class GeoPipeline:
         for name, mod_cfg in self.config.modules.items():
             if not mod_cfg.enabled:
                 continue
+            # region_voter is computed post-loop from all module hits
+            # (never run standalone — that would double-count its votes)
+            if name == "region_voter":
+                continue
 
             try:
                 module = self._instantiate_module(name, self.config)
@@ -536,6 +548,62 @@ class GeoPipeline:
             return None
 
         return cls(config)
+
+    @staticmethod
+    def _nearest_country(lat: float, lon: float) -> str | None:
+        """ISO2 code of the country centroid nearest to a point (≤500km)."""
+        import math
+
+        from geofind.utils.constants import COUNTRY_CENTROIDS
+
+        best_cc: str | None = None
+        best_d = 500.0
+        for cc, (clat, clon) in COUNTRY_CENTROIDS.items():
+            dlat = math.radians(clat - lat)
+            dlon = math.radians(clon - lon)
+            a = (
+                math.sin(dlat / 2) ** 2
+                + math.cos(math.radians(lat))
+                * math.cos(math.radians(clat))
+                * math.sin(dlon / 2) ** 2
+            )
+            d = 2 * 6371 * math.asin(math.sqrt(min(a, 1.0)))
+            if d < best_d:
+                best_d = d
+                best_cc = cc
+        return best_cc
+
+    def _fuse_country_prior(self, all_hits: dict[str, list[ModuleHit]]) -> None:
+        """Softly bias GeoCLIP hits using StreetCLIP's country posterior."""
+        sc_hits = all_hits.get("streetclip") or []
+        gc_hits = all_hits.get("geoclip") or []
+        if not sc_hits or not gc_hits:
+            return
+
+        posterior = {
+            h.metadata.get("country"): h.confidence for h in sc_hits
+        }
+        max_p = max(posterior.values())
+        if max_p < 0.40:
+            return  # StreetCLIP unsure → stay neutral
+
+        adjusted = 0
+        for hit in gc_hits:
+            cc = self._nearest_country(hit.lat, hit.lon)
+            p = posterior.get(cc, 0.0)
+            if p >= 0.10:
+                boost = 1.0 + min((p - 0.10) / 0.35, 1.0)
+                hit.confidence = min(hit.confidence * boost, 0.95)
+                adjusted += 1
+            elif p < 0.02:
+                hit.confidence *= 0.55
+                adjusted += 1
+        if adjusted:
+            logger.debug(
+                "Country-prior fusion: %d/%d geoclip hits adjusted "
+                "(max streetclip p=%.2f)",
+                adjusted, len(gc_hits), max_p,
+            )
 
     def _run_module(
         self, module: BaseModule, media_data: dict[str, Any]

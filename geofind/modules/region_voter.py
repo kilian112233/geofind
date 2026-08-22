@@ -211,19 +211,19 @@ class RegionVoterModule(BaseModule):
         hits: list[ModuleHit] = []
         # Emit only TOP-1 country to concentrate evidence (not spread across 3)
         for code, votes in ranked[:1]:
-            if votes / max(total_votes, 1e-9) < 0.05:
-                break  # skip very weak votes
-            clat, clon, name = _REGION_CENTROIDS.get(code, (0.0, 0.0, code))
             vote_share = votes / max(total_votes, 1e-9)
-            # Higher confidence when vote is decisive
-            conf = min(0.95, vote_share * 2.0)
+            if vote_share < 0.35:
+                break  # require a decisive plurality — weak pluralities mislead
+            clat, clon, name = _REGION_CENTROIDS.get(code, (0.0, 0.0, code))
+            # Conservative confidence: even a unanimous vote stays a hint
+            conf = min(0.5, vote_share)
             n_voters = len(country_voters.get(code, []))
             hits.append(ModuleHit(
                 module="region_voter",
                 lat=clat,
                 lon=clon,
                 confidence=conf,
-                sigma_km=300.0,  # Tighter than before (was 500) to compete with GeoCLIP
+                sigma_km=500.0,  # wide sigma — this is a country-level guess
                 metadata={
                     "country": code,
                     "country_name": name,
