@@ -94,6 +94,9 @@ class FineGrid:
         # Accumulate module likelihoods
         log_post = log_prior.copy()
 
+        # Region bounds in km for hit prefiltering
+        region_radius_km = radius_deg * 111.0
+
         for mod_name, hits in all_hits.items():
             weight = module_weights.get(mod_name, 0.0)
             if weight <= 0 or not hits:
@@ -106,6 +109,17 @@ class FineGrid:
                 hit_lon_rad = math.radians(hit.lon)
                 # Per-hit sigma for area-level modules
                 hit_sigma = hit.sigma_km if hit.sigma_km is not None else self.sigma_km
+
+                # Prefilter: skip hits too far from this region to matter.
+                # Gaussian kernel is negligible beyond ~4.5 sigma.
+                center_dlat = hit_lat_rad - center_lat * math.pi / 180
+                center_dlon = hit_lon_rad - center_lon * math.pi / 180
+                hc = (math.sin(center_dlat / 2) ** 2
+                      + math.cos(hit_lat_rad) * math.cos(center_lat * math.pi / 180)
+                      * math.sin(center_dlon / 2) ** 2)
+                center_dist = 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(min(hc, 1.0)))
+                if center_dist > region_radius_km * 1.2 + 4.5 * hit_sigma:
+                    continue
 
                 dlat = hit_lat_rad - lats_rad
                 dlon = hit_lon_rad - lons_rad

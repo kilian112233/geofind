@@ -38,19 +38,26 @@ _MODULE_CLASS_MAP: dict[str, str] = {
     "birdnet": "BirdnetModule",
     "sun_clock": "SunClockModule",
     "shadow_angle": "ShadowAngleModule",
-    "vision_llm": "VisionLlmModule",
+
     "driving_side": "DrivingSideModule",
     "vegetation": "VegetationModule",
     "license_plate": "LicensePlateModule",
     "currency": "CurrencyModule",
     "audio_scene": "AudioSceneModule",
+    "places365": "Places365Module",
+    "region_voter": "RegionVoterModule",
+    "text_geocoder": "TextGeocoderModule",
+    "solar_geolocate": "SolarGeolocateModule",
+    "terrain_match": "TerrainMatchModule",
 }
 
 # Modules that only work on visual data (image/video frames)
 _VISUAL_MODULES = {
     "exif", "geoclip", "clip_visual", "landmark", "ocr_text",
-    "sun_clock", "shadow_angle", "vision_llm",
+    "sun_clock", "shadow_angle",
     "driving_side", "vegetation", "license_plate", "currency",
+    "clip_retrieval", "places365", "region_voter",
+    "text_geocoder", "solar_geolocate", "terrain_match",
 }
 
 # Modules that only work on audio data
@@ -73,6 +80,22 @@ class GeoPipeline:
         )
         self.reranker = BayesianReranker(self.config)
         self._modules: list[BaseModule] = []
+        self._modules_loaded: bool = False
+        self.last_module_times: dict[str, float] = {}
+
+    def reset(self) -> None:
+        """Reset grid for reuse with a new image (keeps cached modules)."""
+        self.grid = GeoGrid(
+            resolution=self.config.grid_resolution_deg,
+            sigma_km=self.config.gaussian_sigma_km,
+        )
+        self.last_module_times = {}
+        try:
+            from geofind.utils.models import clear_clip_image_cache, clear_ocr_cache
+            clear_clip_image_cache()
+            clear_ocr_cache()
+        except Exception:
+            pass
 
     def analyze(
         self,
@@ -110,7 +133,9 @@ class GeoPipeline:
             progress_callback("_loading", "done")
 
         # ── Load modules ─────────────────────────────────────────────────
-        self._modules = self._load_modules()
+        if not self._modules_loaded:
+            self._modules = self._load_modules()
+            self._modules_loaded = True
         console.print(f"  Loaded [bold]{len(self._modules)}[/] modules")
 
         # ── Run modules ──────────────────────────────────────────────────
@@ -132,7 +157,10 @@ class GeoPipeline:
             if progress_callback:
                 progress_callback(name, "running")
 
+            module_start = time.perf_counter()
             hits = self._run_module(module, media_data)
+            module_elapsed = time.perf_counter() - module_start
+            self.last_module_times[name] = module_elapsed
             all_hits[name] = hits if hits is not None else []
 
             # Free intermediate memory between modules
@@ -142,7 +170,8 @@ class GeoPipeline:
             if hits is not None:
                 modules_run.append(name)
                 console.print(
-                    f"  [green]✓[/] {name}: [bold]{len(hits)}[/] hits"
+                    f"  [green]✓[/] {name}: [bold]{len(hits)}[/] hits "
+                    f"[dim]({module_elapsed:.1f}s)[/]"
                 )
             else:
                 modules_failed.append(name)
@@ -151,13 +180,29 @@ class GeoPipeline:
             if progress_callback:
                 progress_callback(name, "done" if hits is not None else "failed")
 
+        # ── Region voting — combine area-level signals ────────────────
+        try:
+            from geofind.modules.region_voter import RegionVoterModule
+            region_hits = RegionVoterModule.vote(all_hits, self.config)
+            if region_hits:
+                all_hits["region_voter"] = region_hits
+                modules_run.append("region_voter")
+                console.print(
+                    f"  [green]✓[/] region_voter: [bold]{len(region_hits)}[/] "
+                    f"consensus hits"
+                )
+        except Exception as e:
+            logger.debug(f"Region voter failed: {e}")
+
         # ── Build heatmap ────────────────────────────────────────────────
         if progress_callback:
             progress_callback("_grid", "running")
 
         console.print("  Building probability grid...")
+        grid_start = time.perf_counter()
         for name in modules_run:
             self.grid.add_module_hits(name, all_hits[name])
+        self.last_module_times["_grid"] = time.perf_counter() - grid_start
 
         if progress_callback:
             progress_callback("_grid", "done")
@@ -173,7 +218,9 @@ class GeoPipeline:
             if name in self.config.modules
         }
 
+        rerank_start = time.perf_counter()
         candidates = self.reranker.rerank(self.grid, all_hits, module_weights)
+        self.last_module_times["_rerank"] = time.perf_counter() - rerank_start
 
         if progress_callback:
             progress_callback("_rerank", "done")
@@ -189,6 +236,7 @@ class GeoPipeline:
                 progress_callback("_hierarchical", "running")
 
             console.print("  Running hierarchical fine-grid refinement...")
+            hier_start = time.perf_counter()
             try:
                 from geofind.core.fine_grid import FineGrid
 
@@ -221,85 +269,61 @@ class GeoPipeline:
                     f"  [yellow]⚠[/] Hierarchical refinement failed: {e}"
                 )
                 logger.debug(f"Hierarchical refinement error: {e}", exc_info=True)
+            finally:
+                self.last_module_times["_hierarchical"] = (
+                    time.perf_counter() - hier_start
+                )
 
             if progress_callback:
                 progress_callback("_hierarchical", "done")
 
-        # ── GeoCLIP-guided fine grid (explore raw GPS predictions) ──────
-        if (
-            self.config.hierarchical_enabled
-            and "geoclip" in all_hits
-            and all_hits["geoclip"]
-            and len(module_weights) > 0
-        ):
-            if progress_callback:
-                progress_callback("_geoclip_fine", "running")
-
-            console.print("  Running GeoCLIP-guided fine grid...")
-            try:
-                from geofind.core.fine_grid import FineGrid
-
-                fg = FineGrid(
-                    resolution_deg=self.config.fine_resolution_deg,
-                    sigma_km=self.config.fine_sigma_km,
+        # ── Region-voter guided fine grid ──────────────────────────────
+        # When region_voter voted for a country but no fine candidates are
+        # near its centroid, add fine grid candidates there too.
+        if "region_voter" in all_hits and all_hits["region_voter"]:
+            rv_hit = None
+            for h in all_hits["region_voter"]:
+                if h.metadata.get("type") != "precise_agreement":
+                    rv_hit = h
+                    break
+            if rv_hit:
+                # Check if any existing candidate is already within 100km
+                from geofind.utils.geo import haversine_km as _hav_check, LatLon as _LL
+                rv_pt = _LL(rv_hit.lat, rv_hit.lon)
+                has_near = any(
+                    _hav_check(_LL(c.lat, c.lon), rv_pt) < 100
+                    for c in candidates
                 )
+                if not has_near:
+                    try:
+                        from geofind.core.fine_grid import FineGrid
+                        rv_fine = FineGrid(
+                            resolution_deg=self.config.fine_resolution_deg,
+                            sigma_km=self.config.fine_sigma_km,
+                        )
+                        rv_fine_cands = rv_fine.compute_fine_posterior(
+                            center_lat=rv_hit.lat,
+                            center_lon=rv_hit.lon,
+                            radius_deg=self.config.fine_region_radius_deg,
+                            all_hits=all_hits,
+                            module_weights=module_weights,
+                        )
+                        if rv_fine_cands:
+                            candidates.extend(rv_fine_cands)
+                            candidates.sort(key=lambda c: c.probability, reverse=True)
+                            console.print(
+                                f"  [cyan]ℹ[/] Region-voter guided: "
+                                f"{len(rv_fine_cands)} extra candidates near "
+                                f"{rv_hit.metadata.get('country_name', '?')} "
+                                f"({rv_hit.lat:.1f}, {rv_hit.lon:.1f})"
+                            )
+                    except Exception as e:
+                        logger.debug(f"Region-voter fine grid failed: {e}")
 
-                # Get top-2 GeoCLIP predictions sorted by confidence
-                geoclip_hits = sorted(
-                    all_hits["geoclip"],
-                    key=lambda h: h.confidence,
-                    reverse=True,
-                )[:2]
-
-                # Check which predictions are already covered by existing candidates
-                from geofind.utils.geo import haversine_km as _hk, LatLon as _LL
-                new_centers = []
-                for hit in geoclip_hits:
-                    is_covered = False
-                    for c in candidates:
-                        if _hk(_LL(hit.lat, hit.lon), _LL(c.lat, c.lon)) < 50.0:
-                            is_covered = True
-                            break
-                    if not is_covered:
-                        new_centers.append(hit)
-
-                extra_fine_candidates = []
-                for hit in new_centers:
-                    fine_cands = fg.compute_fine_posterior(
-                        center_lat=hit.lat,
-                        center_lon=hit.lon,
-                        radius_deg=0.8,
-                        all_hits=all_hits,
-                        module_weights=module_weights,
-                    )
-                    # Tag these with GeoCLIP source info
-                    for fc in fine_cands:
-                        fc.metadata = {
-                            "source": "geoclip_guided",
-                            "geoclip_lat": hit.lat,
-                            "geoclip_lon": hit.lon,
-                            "geoclip_conf": hit.confidence,
-                        }
-                    extra_fine_candidates.extend(fine_cands)
-
-                if extra_fine_candidates:
-                    candidates.extend(extra_fine_candidates)
-                    # Re-sort by probability
-                    candidates.sort(key=lambda c: c.probability, reverse=True)
-                    console.print(
-                        f"  [green]✓[/] GeoCLIP fine grid: "
-                        f"{len(extra_fine_candidates)} candidates from "
-                        f"{len(new_centers)} GeoCLIP predictions"
-                    )
-
-            except Exception as e:
-                console.print(
-                    f"  [yellow]⚠[/] GeoCLIP fine grid failed: {e}"
-                )
-                logger.debug(f"GeoCLIP fine grid error: {e}", exc_info=True)
-
-            if progress_callback:
-                progress_callback("_geoclip_fine", "done")
+        # ── GeoCLIP-guided fine grid DISABLED ──────────────────────────
+        # GeoCLIP often confidently predicts wrong locations; adding fine-grid
+        # candidates at wrong positions consistently hurts accuracy.
+        # The hierarchical fine grid (above) already covers the best candidates.
 
         # ── Inject exact GPS coordinates from EXIF (bypass grid) ────────
         # When EXIF finds GPS data, we have exact coordinates (within ~5m).

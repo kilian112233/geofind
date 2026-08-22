@@ -19,6 +19,20 @@ dependencies = [
     "requests>=2.28",
 ]
 
+[project.optional-dependencies]
+geoclip = ["geoclip"]
+ocr = ["easyocr"]
+places365 = ["torch", "torchvision"]
+solar = ["astral"]
+all = [
+    "geoclip",
+    "easyocr",
+    "torch",
+    "torchvision",
+    "astral",
+    "ultralytics",
+]
+
 [project.scripts]
 geofind = "geofind.cli:app"
 

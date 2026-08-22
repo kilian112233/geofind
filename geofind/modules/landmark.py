@@ -12,14 +12,14 @@ from geofind.modules.base import BaseModule
 
 logger = logging.getLogger(__name__)
 
-# CLIP ViT-B/32 temperature is 100.0
+# CLIP ViT-L/14 temperature (logits range ~0.05-0.16)
 _CLIP_TEMPERATURE = 100.0
-# Threshold on approximate cosine similarity to keep a landmark
-_PASS1_THRESHOLD = 0.20
-# Refined-pass threshold (slightly lower after re-scoring)
-_PASS2_THRESHOLD = 0.22
+# Threshold on approximate cosine similarity to keep a landmark (ViT-L/14 range)
+_PASS1_THRESHOLD = 0.085
+# Refined-pass threshold
+_PASS2_THRESHOLD = 0.090
 # Candidate count to send through pass 2
-_PASS1_TOP_K = 15
+_PASS1_TOP_K = 10
 
 
 class LandmarkModule(BaseModule):
@@ -56,26 +56,34 @@ class LandmarkModule(BaseModule):
             self._landmark_prompts.append(prompt)
             self._prompt_to_key[idx] = key
             self._refined_prompts[idx] = refined
+        # Full refined-prompt list (same order as _landmark_prompts) so
+        # pass-2 scores can come from one cached embedding matrix.
+        self._refined_list: list[str] = [
+            self._refined_prompts[i] for i in range(len(self._landmark_prompts))
+        ]
         super().prepare()
 
     def _cosine_scores(self, image: Any, prompts: list[str]) -> list[float]:
-        """Run CLIP and return approximate cosine similarity scores."""
-        import torch
+        """Run CLIP and return approximate cosine similarity scores.
 
-        inputs = self._processor(
-            text=prompts, images=image,
-            return_tensors="pt", padding=True,
-        )
-        with torch.no_grad():
-            outputs = self._model(**inputs)
-            logits = outputs.logits_per_image[0]
-        return [logit / _CLIP_TEMPERATURE for logit in logits.tolist()]
+        Uses the shared embedding caches — static prompt lists are encoded
+        once, and repeated images reuse a cached ViT-L/14 forward pass.
+        """
+        from geofind.utils.models import clip_zero_shot_scores
+
+        return clip_zero_shot_scores(image, "landmark_p1", prompts)
+
+    def _cosine_scores_refined(self, image: Any) -> list[float]:
+        """Cosine scores against the full refined-prompt set (cached)."""
+        from geofind.utils.models import clip_zero_shot_scores
+
+        return clip_zero_shot_scores(image, "landmark_p2", self._refined_list)
 
     @staticmethod
     def _score_to_confidence(cosine_score: float) -> float:
         """Map cosine similarity to a 0-1 confidence value."""
-        # Linear ramp: 0.20 → 0.05, 0.25 → 0.3, 0.30 → 0.6, 0.35 → 0.9
-        raw = (cosine_score - 0.20) * 8.0
+        # Linear ramp calibrated for ViT-L/14: 0.065 → 0.05, 0.10 → 0.30, 0.14 → 0.70, 0.16 → 0.90
+        raw = (cosine_score - 0.065) * 10.0
         return min(0.9, max(0.05, raw))
 
     def detect(
@@ -108,9 +116,9 @@ class LandmarkModule(BaseModule):
         pass1.sort(key=lambda x: x[1], reverse=True)
         top_k = pass1[:_PASS1_TOP_K]
 
-        # Pass 2: re-score top candidates with refined prompts
-        refined = [self._refined_prompts[idx] for idx, _ in top_k]
-        refined_scores = self._cosine_scores(image, refined)
+        # Pass 2: re-score top candidates with refined prompts (cached set)
+        refined_scores_all = self._cosine_scores_refined(image)
+        refined_scores = [refined_scores_all[idx] for idx, _ in top_k]
 
         hits: list[ModuleHit] = []
         for (idx, _score), refined_score in zip(top_k, refined_scores):

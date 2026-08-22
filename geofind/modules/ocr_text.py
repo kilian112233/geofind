@@ -898,17 +898,12 @@ class OcrTextModule(BaseModule):
             return []
 
         try:
-            import numpy as np
-            img_array = np.array(image)
-            results = self._reader.readtext(img_array)
+            from geofind.utils.models import extract_ocr_text_cached
+            full_text = extract_ocr_text_cached(image)
         except Exception as e:
             self._log(f"OCR failed: {e}", logging.WARNING)
             return []
 
-        if not results:
-            return []
-
-        full_text = " ".join(r[1] for r in results if len(r) > 1)
         if not full_text.strip():
             return []
 
@@ -917,7 +912,11 @@ class OcrTextModule(BaseModule):
         scripts = self._detect_scripts(full_text)
         country_votes: dict[str, float] = {}
 
-        from geofind.utils.constants import SCRIPT_COUNTRY_HINTS
+        from geofind.utils.constants import (
+            SCRIPT_COUNTRY_HINTS,
+            language_country_votes,
+            COUNTRY_CENTROIDS as _FULL_CENTROIDS,
+        )
 
         for script, count in scripts.items():
             hint_key = _SCRIPT_TO_HINT_KEY.get(script, script)
@@ -926,13 +925,32 @@ class OcrTextModule(BaseModule):
             for cc in countries:
                 country_votes[cc] = country_votes.get(cc, 0.0) + weight
 
+        # Language detection → region votes. Languages cluster around their
+        # origin (German → DE/AT/CH/LI/LU; French → FR/BE/CH/LU) while global
+        # languages like English carry no signal and are excluded upstream.
+        detected_langs: list[str] = []
+        lang_votes = language_country_votes(full_text)
+        if lang_votes:
+            try:
+                from langdetect import detect_langs
+                detected_langs = [
+                    c.lang for c in detect_langs(full_text)[:2]
+                ]
+            except Exception:
+                detected_langs = ["?"]
+            self._log(f"Language votes: {detected_langs} -> {len(lang_votes)} countries")
+            for cc, weight in lang_votes.items():
+                country_votes[cc] = country_votes.get(cc, 0.0) + weight
+
         hits: list[ModuleHit] = []
         if country_votes:
             total = max(sum(country_votes.values()), 1e-9)
             for cc, score in sorted(country_votes.items(), key=lambda x: -x[1]):
                 if score / total < 0.01:
                     continue
-                lat, lon = _COUNTRY_CENTROIDS.get(cc, (0.0, 0.0))
+                lat, lon = _FULL_CENTROIDS.get(
+                    cc, _COUNTRY_CENTROIDS.get(cc, (0.0, 0.0))
+                )
                 # Script detection is COUNTRY-level, not city-level.
                 # Use wide sigma so it covers the whole country, not just
                 # the centroid point.
@@ -942,6 +960,7 @@ class OcrTextModule(BaseModule):
                     country=cc,
                     ocr_text=full_text[:500],
                     scripts=list(scripts.keys()),
+                    languages=detected_langs,
                     hint_level="country",
                 ))
         else:

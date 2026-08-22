@@ -85,8 +85,18 @@ def run_pipeline(
     image_path: Path,
     modules: str | None = None,
     config: PipelineConfig | None = None,
+    pipeline: GeoPipeline | None = None,
 ) -> GeoResult:
-    """Run the geofind pipeline on a single image."""
+    """Run the geofind pipeline on a single image.
+
+    If a pipeline is provided, reuse it (fast — modules stay cached).
+    Otherwise create a new one (slow — reloads models each time).
+    """
+    if pipeline is not None:
+        pipeline.reset()
+        result = pipeline.analyze(image_path)
+        return result
+
     pipeline = GeoPipeline(config)
 
     module_list = None
@@ -226,6 +236,14 @@ def run_all_tests(
     errors = 0
     start_time = time.perf_counter()
 
+    # Create ONE pipeline for all images (modules load once, stay cached)
+    _rich_print("  Creating shared pipeline (modules load once)...")
+    shared_pipeline = GeoPipeline(config)
+    if modules:
+        mod_list = [m.strip() for m in modules.split(",")]
+        for name in shared_pipeline.config.modules:
+            shared_pipeline.config.modules[name].enabled = name in mod_list
+
     def _get_image_path(tc: dict[str, Any]) -> Path:
         """Get the image path, stripping EXIF if needed."""
         base = image_dir / f"{tc['id']}.jpg"
@@ -265,7 +283,7 @@ def run_all_tests(
                     continue
 
                 try:
-                    result = run_pipeline(image_path, modules=modules, config=config)
+                    result = run_pipeline(image_path, modules=modules, config=config, pipeline=shared_pipeline)
                     ir = tracker.record(
                         tid,
                         expected_lat=tc["expected_lat"],
@@ -310,7 +328,7 @@ def run_all_tests(
                 continue
 
             try:
-                result = run_pipeline(image_path, modules=modules, config=config)
+                result = run_pipeline(image_path, modules=modules, config=config, pipeline=shared_pipeline)
                 ir = tracker.record(
                     tid,
                     expected_lat=tc["expected_lat"],

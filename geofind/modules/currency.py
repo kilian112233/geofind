@@ -70,23 +70,16 @@ class CurrencyModule(BaseModule):
 
         import torch
         from PIL import Image
+        from geofind.utils.models import clip_softmax_scores
 
         image = self._get_image(media_path, frames)
         if image is None:
             return []
 
-        inputs = self._processor(
-            text=self._all_prompts, images=image,
-            return_tensors="pt", padding=True,
-        )
-
-        with torch.no_grad():
-            outputs = self._model(**inputs)
-            logits = outputs.logits_per_image[0]
-            probs = logits.softmax(dim=0)
+        probs = clip_softmax_scores(image, "currency", self._all_prompts)
 
         currency_scores: dict[str, float] = {}
-        for idx, prob in enumerate(probs.tolist()):
+        for idx, prob in enumerate(probs):
             currency = self._prompt_to_currency[idx]
             currency_scores[currency] = currency_scores.get(currency, 0.0) + prob
 

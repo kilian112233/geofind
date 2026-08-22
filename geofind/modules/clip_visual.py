@@ -1116,6 +1116,59 @@ _CITY_CENTROIDS: dict[str, tuple[float, float]] = {
     "maldives": (4.1755, 73.5093),
 }
 
+# ── Country centroids (manually curated — capital coordinates) ──────
+_COUNTRY_CENTROIDS: dict[str, tuple[float, float]] = {
+    "US": (38.9, -77.0), "CN": (39.9, 116.4), "IN": (28.6, 77.2),
+    "BR": (-15.8, -47.9), "JP": (35.7, 139.7), "DE": (52.5, 13.4),
+    "GB": (51.5, -0.1), "FR": (48.9, 2.3), "IT": (41.9, 12.5),
+    "ES": (40.4, -3.7), "MX": (19.4, -99.1), "KR": (37.6, 127.0),
+    "RU": (55.8, 37.6), "AU": (-35.3, 149.1), "CA": (45.4, -75.7),
+    "TH": (13.8, 100.5), "TR": (39.9, 32.9),
+    "SA": (24.7, 46.7), "EG": (30.0, 31.2), "NG": (9.1, 7.5),
+    "ZA": (-33.9, 18.4), "KE": (-1.3, 36.8), "PH": (14.6, 121.0),
+    "ID": (-6.2, 106.8), "PK": (33.7, 73.1), "BD": (23.8, 90.4),
+    "VN": (21.0, 105.8), "MY": (3.1, 101.7), "SG": (1.3, 103.8),
+    "CO": (4.6, -74.1), "AR": (-34.6, -58.4), "CL": (-33.4, -70.7),
+    "PE": (-12.0, -77.0), "PL": (52.2, 21.0), "NL": (52.4, 4.9),
+    "SE": (59.3, 18.1), "NO": (59.9, 10.8), "FI": (60.2, 24.9),
+    "DK": (55.7, 12.6), "AT": (48.2, 16.4), "CH": (46.9, 7.4),
+    "BE": (50.9, 4.4), "PT": (38.7, -9.1), "GR": (38.0, 23.7),
+    "CZ": (50.1, 14.4), "RO": (44.4, 26.1), "HU": (47.5, 19.1),
+    "UA": (50.4, 30.5), "IL": (31.8, 35.2), "AE": (25.3, 55.3),
+    "MA": (33.6, -7.6), "TZ": (-6.8, 37.3), "ET": (9.0, 38.7),
+    "GH": (5.6, -0.2), "EC": (-0.2, -78.5), "BO": (-16.5, -68.1),
+}
+
+_COUNTRY_NAMES: dict[str, str] = {
+    "US": "the United States", "CN": "China", "IN": "India",
+    "BR": "Brazil", "JP": "Japan", "DE": "Germany",
+    "GB": "the United Kingdom", "FR": "France", "IT": "Italy",
+    "ES": "Spain", "MX": "Mexico", "KR": "South Korea",
+    "RU": "Russia", "AU": "Australia", "CA": "Canada",
+    "TH": "Thailand", "TR": "Turkey",
+    "SA": "Saudi Arabia", "EG": "Egypt", "NG": "Nigeria",
+    "ZA": "South Africa", "KE": "Kenya", "PH": "the Philippines",
+    "ID": "Indonesia", "PK": "Pakistan", "BD": "Bangladesh",
+    "VN": "Vietnam", "MY": "Malaysia", "SG": "Singapore",
+    "CO": "Colombia", "AR": "Argentina", "CL": "Chile",
+    "PE": "Peru", "PL": "Poland", "NL": "the Netherlands",
+    "SE": "Sweden", "NO": "Norway", "FI": "Finland",
+    "DK": "Denmark", "AT": "Austria", "CH": "Switzerland",
+    "BE": "Belgium", "PT": "Portugal", "GR": "Greece",
+    "CZ": "the Czech Republic", "RO": "Romania", "HU": "Hungary",
+    "UA": "Ukraine", "IL": "Israel", "AE": "the United Arab Emirates",
+    "MA": "Morocco", "TZ": "Tanzania", "ET": "Ethiopia",
+    "GH": "Ghana", "EC": "Ecuador", "BO": "Bolivia",
+}
+
+_COUNTRY_PROMPTS: dict[str, list[str]] = {}
+for _code, _name in _COUNTRY_NAMES.items():
+    _COUNTRY_PROMPTS[_code] = [
+        f"a street scene in {_name}",
+        f"an outdoor photo taken in {_name}",
+        f"road and buildings in {_name}",
+    ]
+
 
 class ClipVisualModule(BaseModule):
     """Zero-shot CLIP scene classification mapped to geographic biome priors."""
@@ -1140,6 +1193,8 @@ class ClipVisualModule(BaseModule):
         self._model, self._processor = get_clip_shared()
         self._biome_prompts = BIOME_PROMPTS
         self._biome_centroids = _BIOME_CENTROIDS
+        self._country_prompts = _COUNTRY_PROMPTS
+        self._country_centroids = _COUNTRY_CENTROIDS
         self._city_prompts = _CITY_PROMPTS
         self._city_centroids = _CITY_CENTROIDS
         super().prepare()
@@ -1154,8 +1209,7 @@ class ClipVisualModule(BaseModule):
         if not self._ready:
             return []
 
-        import torch
-        from PIL import Image
+        from geofind.utils.models import clip_softmax_scores
 
         image = self._get_image(media_path, frames)
         if image is None:
@@ -1170,17 +1224,10 @@ class ClipVisualModule(BaseModule):
                 all_prompts.append(p)
                 prompt_to_biome[idx] = biome
 
-        inputs = self._processor(
-            text=all_prompts, images=image, return_tensors="pt", padding=True
-        )
-
-        with torch.no_grad():
-            outputs = self._model(**inputs)
-            logits = outputs.logits_per_image[0]
-            probs = logits.softmax(dim=0)
+        probs = clip_softmax_scores(image, "clipvis_biome", all_prompts)
 
         biome_scores: dict[str, float] = {}
-        for idx, prob in enumerate(probs.tolist()):
+        for idx, prob in enumerate(probs):
             biome = prompt_to_biome[idx]
             biome_scores[biome] = biome_scores.get(biome, 0.0) + prob
 
@@ -1197,6 +1244,37 @@ class ClipVisualModule(BaseModule):
                 hint_level="biome",
             ))
 
+        # ── Country scene classification ─────────────────────────────────
+        country_prompts: list[str] = []
+        prompt_to_country: dict[int, str] = {}
+        for country, prompts in self._country_prompts.items():
+            for p in prompts:
+                idx = len(country_prompts)
+                country_prompts.append(p)
+                prompt_to_country[idx] = country
+
+        country_probs = clip_softmax_scores(
+            image, "clipvis_country", country_prompts
+        )
+
+        country_scores: dict[str, float] = {}
+        for idx, prob in enumerate(country_probs):
+            country = prompt_to_country[idx]
+            country_scores[country] = country_scores.get(country, 0.0) + prob
+
+        top_countries = sorted(country_scores.items(), key=lambda x: -x[1])[:5]
+        for country, score in top_countries:
+            if score < 0.03:
+                continue
+            lat, lon = self._country_centroids.get(country, (0.0, 0.0))
+            hits.append(self._make_hit(
+                lat, lon, min(score, 1.0),
+                sigma_km=800.0,  # Country-level — wide spread
+                country=country,
+                raw_score=score,
+                hint_level="country",
+            ))
+
         # ── City scene classification ────────────────────────────────────
         city_prompts: list[str] = []
         prompt_to_city: dict[int, str] = {}
@@ -1206,17 +1284,10 @@ class ClipVisualModule(BaseModule):
                 city_prompts.append(p)
                 prompt_to_city[idx] = city
 
-        city_inputs = self._processor(
-            text=city_prompts, images=image, return_tensors="pt", padding=True
-        )
-
-        with torch.no_grad():
-            city_outputs = self._model(**city_inputs)
-            city_logits = city_outputs.logits_per_image[0]
-            city_probs = city_logits.softmax(dim=0)
+        city_probs = clip_softmax_scores(image, "clipvis_city", city_prompts)
 
         city_scores: dict[str, float] = {}
-        for idx, prob in enumerate(city_probs.tolist()):
+        for idx, prob in enumerate(city_probs):
             city = prompt_to_city[idx]
             city_scores[city] = city_scores.get(city, 0.0) + prob
 

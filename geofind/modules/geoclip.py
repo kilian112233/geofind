@@ -49,6 +49,15 @@ class GeoclipModule(BaseModule):
         def _load():
             from geoclip import GeoCLIP
             model = GeoCLIP()
+            # Precompute location-encoder features for the 100K GPS gallery.
+            # The stock predict() re-encodes all gallery coordinates through
+            # 3 capsule networks on EVERY call even though they never change —
+            # this precomputation turns ~12s/image into ~1s on CPU.
+            import torch
+            import torch.nn.functional as F
+            with torch.no_grad():
+                loc_feats = model.location_encoder(model.gps_gallery)
+                model._gallery_loc_feats = F.normalize(loc_feats, dim=1)
             return model
 
         self._model = get_cached_model("geoclip", _load)
@@ -70,12 +79,31 @@ class GeoclipModule(BaseModule):
             return []
 
         try:
-            # GeoCLIP predict returns (gps_predictions, probabilities)
-            # gps_predictions: tensor of (lat, lon) pairs
-            # probabilities: tensor of confidence scores
-            gps_preds, probs = self._model.predict(
-                str(image_path), top_k=10
-            )
+            # Fast path: cached gallery location features + single image
+            # encode (equivalent to model.predict but ~10x faster on CPU).
+            import torch
+            import torch.nn.functional as F
+            from PIL import Image as _PILImage
+
+            gallery_feats = getattr(self._model, "_gallery_loc_feats", None)
+            if gallery_feats is not None:
+                img = _PILImage.open(str(image_path))
+                img_t = self._model.image_encoder.preprocess_image(img).to(
+                    self._model.device
+                )
+                with torch.no_grad():
+                    feats = self._model.image_encoder(img_t)
+                    feats = F.normalize(feats, dim=1)
+                    logit_scale = self._model.logit_scale.exp()
+                    logits = logit_scale * (feats @ gallery_feats.t())
+                    probs_all = logits.softmax(dim=-1)[0]
+                    top = torch.topk(probs_all, 10)
+                gps_preds = self._model.gps_gallery[top.indices]
+                probs = top.values
+            else:
+                gps_preds, probs = self._model.predict(
+                    str(image_path), top_k=10
+                )
 
             hits: list[ModuleHit] = []
 
@@ -159,45 +187,75 @@ class GeoclipModule(BaseModule):
                 f"sigma={cluster_sigma:.0f}km"
             )
 
-            for i in range(len(valid_lats)):
-                lat = valid_lats[i]
-                lon = valid_lons[i]
-                prob = valid_probs[i]
+            # ── Emit consolidated hits ──────────────────────────────────
+            if cluster_label == "tight":
+                # Tight cluster: emit all predictions (they're near each other)
+                for i in range(len(valid_lats)):
+                    lat = valid_lats[i]
+                    lon = valid_lons[i]
+                    prob = valid_probs[i]
 
-                if i == 0:
-                    # Top prediction: confidence based on clustering + peak dominance
-                    # Tight cluster + high dominance = confident
-                    # Spread + low dominance = uncertain
-                    base_conf = 0.3 + 0.4 * min(peak_ratio / 5.0, 1.0)
-                    if cluster_label == "tight":
+                    if i == 0:
+                        base_conf = 0.3 + 0.4 * min(peak_ratio / 5.0, 1.0)
                         confidence = min(base_conf + 0.2, 0.9)
-                    elif cluster_label == "moderate":
-                        confidence = min(base_conf, 0.7)
                     else:
-                        confidence = min(base_conf * 0.5, 0.4)
-                else:
-                    # Secondary predictions: much lower, scaled by cluster quality
-                    rel_prob = prob / valid_probs[0] if valid_probs[0] > 0 else 0
-                    if cluster_label == "tight":
+                        rel_prob = prob / valid_probs[0] if valid_probs[0] > 0 else 0
                         confidence = max(0.05, min(0.35, rel_prob * 0.8))
-                    else:
-                        confidence = max(0.02, min(0.15, rel_prob * 0.3))
+
+                    hits.append(self._make_hit(
+                        lat=lat, lon=lon, confidence=confidence,
+                        sigma_km=cluster_sigma, rank=i,
+                        raw_probability=prob, cluster_label=cluster_label,
+                        avg_cluster_km=avg_cluster_km, model="geoclip",
+                    ))
+                    self._log(
+                        f"Prediction #{i+1}: ({lat:.4f}, {lon:.4f}) "
+                        f"conf={confidence:.3f} raw_prob={prob:.6f}"
+                    )
+            else:
+                # Spread/moderate cluster: consolidate into 2 meaningful hits
+                # Hit 1: top prediction (model's best guess)
+                top_conf_base = 0.3 + 0.4 * min(peak_ratio / 5.0, 1.0)
+                if cluster_label == "moderate":
+                    top_conf = min(top_conf_base, 0.6)
+                else:
+                    top_conf = min(top_conf_base * 0.5, 0.3)
 
                 hits.append(self._make_hit(
-                    lat=lat,
-                    lon=lon,
-                    confidence=confidence,
-                    sigma_km=cluster_sigma,  # Wide sigma based on cluster spread
-                    rank=i,
-                    raw_probability=prob,
+                    lat=valid_lats[0], lon=valid_lons[0],
+                    confidence=top_conf, sigma_km=cluster_sigma,
+                    rank=0, raw_probability=valid_probs[0],
                     cluster_label=cluster_label,
-                    avg_cluster_km=avg_cluster_km,
-                    model="geoclip",
+                    avg_cluster_km=avg_cluster_km, model="geoclip",
                 ))
-
                 self._log(
-                    f"Prediction #{i+1}: ({lat:.4f}, {lon:.4f}) "
-                    f"conf={confidence:.3f} raw_prob={prob:.6f}"
+                    f"Prediction #1: ({valid_lats[0]:.4f}, {valid_lons[0]:.4f}) "
+                    f"conf={top_conf:.3f} raw_prob={valid_probs[0]:.6f}"
+                )
+
+                # Hit 2: weighted centroid of top-3 predictions
+                n_centroid = min(3, len(valid_lats))
+                total_w = sum(valid_probs[:n_centroid])
+                if total_w > 0:
+                    c_lat = sum(valid_probs[j] * valid_lats[j] for j in range(n_centroid)) / total_w
+                    c_lon = sum(valid_probs[j] * valid_lons[j] for j in range(n_centroid)) / total_w
+                else:
+                    c_lat, c_lon = valid_lats[0], valid_lons[0]
+
+                centroid_conf = top_conf * 0.7  # centroid gets 70% of top confidence
+                centroid_sigma = max(cluster_sigma, 150.0)  # at least 150km for centroid
+
+                hits.append(self._make_hit(
+                    lat=c_lat, lon=c_lon,
+                    confidence=centroid_conf, sigma_km=centroid_sigma,
+                    rank=1, raw_probability=total_w / n_centroid if n_centroid > 0 else 0,
+                    cluster_label=cluster_label,
+                    avg_cluster_km=avg_cluster_km, model="geoclip",
+                    hit_type="centroid",
+                ))
+                self._log(
+                    f"Consensus centroid: ({c_lat:.4f}, {c_lon:.4f}) "
+                    f"conf={centroid_conf:.3f} (from top-{n_centroid})"
                 )
 
             return hits

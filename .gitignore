@@ -36,3 +36,7 @@ test_images/
 yolov8n.pt
 *.gguf
 docs/EVAL_OVERVIEW.md
+
+# Logs
+*.log
+*.err.log

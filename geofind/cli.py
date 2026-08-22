@@ -318,7 +318,7 @@ def modules():
         "birdnet": "Bird species identification",
         "sun_clock": "Sun position / time-of-day estimation",
         "shadow_angle": "Shadow angle geolocation",
-        "vision_llm": "Vision LLM scene description",
+
         "driving_side": "Left/right traffic side detection",
         "vegetation": "Vegetation type classification",
         "license_plate": "License plate format detection",

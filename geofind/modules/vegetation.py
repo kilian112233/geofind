@@ -47,8 +47,7 @@ class VegetationModule(BaseModule):
         if not self._ready:
             return []
 
-        import torch
-        from PIL import Image
+        from geofind.utils.models import clip_softmax_scores
 
         image = self._get_image(media_path, frames)
         if image is None:
@@ -62,18 +61,10 @@ class VegetationModule(BaseModule):
                 all_prompts.append(p)
                 prompt_to_biome[idx] = biome
 
-        inputs = self._processor(
-            text=all_prompts, images=image,
-            return_tensors="pt", padding=True,
-        )
-
-        with torch.no_grad():
-            outputs = self._model(**inputs)
-            logits = outputs.logits_per_image[0]
-            probs = logits.softmax(dim=0)
+        probs = clip_softmax_scores(image, "vegetation", all_prompts)
 
         biome_scores: dict[str, float] = {}
-        for idx, prob in enumerate(probs.tolist()):
+        for idx, prob in enumerate(probs):
             biome = prompt_to_biome[idx]
             biome_scores[biome] = biome_scores.get(biome, 0.0) + prob
 

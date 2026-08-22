@@ -74,28 +74,38 @@ class SunClockModule(BaseModule):
         return hits
 
     def _read_clock(self, image: Any) -> tuple[int, int] | None:
-        if self._ocr_reader is None:
-            return None
+        """Find a clock time in the image's OCR text.
 
-        import numpy as np
+        Uses the shared cached OCR text (no extra EasyOCR pass). Falls back
+        to a raw read only if the shared pipeline is unavailable.
+        """
+        import re
 
         try:
-            img_array = np.array(image)
-            results = self._ocr_reader.readtext(img_array)
-        except Exception as e:
-            self._log(f"Clock OCR failed: {e}", logging.WARNING)
+            from geofind.utils.models import extract_ocr_text_cached
+            full_text = extract_ocr_text_cached(image)
+        except Exception:
+            full_text = ""
+
+        if not full_text and self._ocr_reader is not None:
+            try:
+                import numpy as np
+                results = self._ocr_reader.readtext(np.array(image))
+                full_text = " ".join(r[1] for r in results if len(r) > 1)
+            except Exception as e:
+                self._log(f"Clock OCR failed: {e}", logging.WARNING)
+                return None
+
+        if not full_text:
             return None
 
-        import re
         time_pattern = re.compile(r"(\d{1,2})[:\s.](\d{2})")
 
-        for _, text, conf in results:
-            match = time_pattern.search(text)
-            if match:
-                h = int(match.group(1))
-                m = int(match.group(2))
-                if 0 <= h <= 23 and 0 <= m <= 59:
-                    return (h, m)
+        for match in time_pattern.finditer(full_text):
+            h = int(match.group(1))
+            m = int(match.group(2))
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return (h, m)
 
         return None
 

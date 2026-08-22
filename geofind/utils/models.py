@@ -84,7 +84,7 @@ def ensure_clip_model(models_dir: Path | None = None) -> str:
     """Ensure CLIP model is available. Returns model name for transformers."""
     # CLIP models are downloaded by HuggingFace transformers automatically
     # Just return the model name
-    return "openai/clip-vit-base-patch32"
+    return "openai/clip-vit-large-patch14"
 
 
 def ensure_landmark_model(models_dir: Path | None = None) -> str:
@@ -137,3 +137,186 @@ def _load_clip():
 def get_cache_info() -> dict[str, bool]:
     """Report which models are currently cached in memory."""
     return {k: True for k in _model_cache}
+
+
+# ── Shared CLIP embedding caches ────────────────────────────────────────────
+# Static prompt sets are encoded once and reused across images. Image
+# embeddings are cached per unique image content so multiple modules running
+# on the same frame share a single ViT-L/14 forward pass.
+
+_clip_text_cache: dict[str, Any] = {}
+_clip_image_cache: dict[str, Any] = {}
+
+
+def _unwrap_clip_features(feats: Any, kind: str) -> Any:
+    """Unwrap transformers 5.x model outputs to a plain tensor.
+
+    `kind` is "text" or "image" — selects the right embeds attribute.
+    """
+    if hasattr(feats, "shape") and hasattr(feats, "norm"):
+        return feats  # already a tensor
+    primary = f"{kind}_embeds"
+    for attr in (primary, "pooler_output", "last_hidden_state"):
+        val = getattr(feats, attr, None)
+        if val is not None:
+            return val
+    raise TypeError(f"Unexpected CLIP feature type: {type(feats)}")
+
+
+def clip_text_embeddings(key: str, prompts: list[str]) -> Any:
+    """Encode a static prompt list once; returns normalized tensor [N, D].
+
+    Results are cached by `key` — subsequent calls are free. Prompt lists
+    passed here must be deterministic per key.
+    """
+    if key not in _clip_text_cache:
+        import torch
+
+        model, processor = get_clip_shared()
+        chunks: list[Any] = []
+        with torch.no_grad():
+            for i in range(0, len(prompts), 64):
+                inputs = processor(
+                    text=prompts[i : i + 64], return_tensors="pt", padding=True
+                )
+                feats = _unwrap_clip_features(
+                    model.get_text_features(**inputs), "text"
+                )
+                chunks.append(feats / feats.norm(dim=-1, keepdim=True))
+        _clip_text_cache[key] = torch.cat(chunks)
+    return _clip_text_cache[key]
+
+
+def clip_image_embedding(image: Any) -> Any:
+    """Encode an image once per unique content; returns normalized tensor [D].
+
+    Cached by content hash so repeated `.convert("RGB")` copies of the same
+    frame across modules hit the cache instead of re-running the encoder.
+    """
+    import hashlib
+
+    try:
+        key = hashlib.md5(image.tobytes()).hexdigest()
+    except Exception:
+        key = f"id:{id(image)}"
+
+    emb = _clip_image_cache.get(key)
+    if emb is None:
+        import torch
+
+        model, processor = get_clip_shared()
+        with torch.no_grad():
+            inputs = processor(images=image, return_tensors="pt")
+            feats = _unwrap_clip_features(
+                model.get_image_features(**inputs), "image"
+            )
+
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        emb = feats[0]
+        _clip_image_cache[key] = emb
+        # Keep the cache small — only the most recent frames
+        while len(_clip_image_cache) > 4:
+            _clip_image_cache.pop(next(iter(_clip_image_cache)))
+    return _clip_image_cache[key]
+
+
+def clip_zero_shot_scores(
+    image: Any, cache_key: str, prompts: list[str]
+) -> list[float]:
+    """Cosine similarity of an image against a cached prompt set.
+
+    Values are comparable to HF `logits_per_image / 100`.
+    """
+    img_emb = clip_image_embedding(image)
+    txt_embs = clip_text_embeddings(cache_key, prompts)
+    return (img_emb @ txt_embs.T).tolist()
+
+
+def clip_softmax_scores(
+    image: Any, cache_key: str, prompts: list[str]
+) -> list[float]:
+    """Softmax probabilities over a prompt set (mirrors logits.softmax)."""
+    import torch
+
+    scores = clip_zero_shot_scores(image, cache_key, prompts)
+    probs = torch.softmax(torch.tensor(scores) * 100.0, dim=0)
+    return probs.tolist()
+
+
+def clear_clip_image_cache() -> None:
+    """Drop cached image embeddings (call when analyzing a new media file)."""
+    _clip_image_cache.clear()
+
+
+# ── Shared OCR cache ────────────────────────────────────────────────────────
+# Multiple modules need the same EasyOCR pass over the same frame. The full
+# preprocessing pipeline (CLAHE → denoise → sharpen → Otsu) plus inference is
+# run ONCE per unique image content and the extracted text shared.
+
+_ocr_text_cache: dict[str, str] = {}
+
+
+def extract_ocr_text_cached(image: Any) -> str:
+    """Extract all visible text from an image via the shared OCR pipeline.
+
+    Results are cached per image content hash — repeated calls across modules
+    are free.
+    """
+    import hashlib
+
+    try:
+        key = "ocr:" + hashlib.md5(image.tobytes()).hexdigest()
+    except Exception:
+        key = f"ocr:id:{id(image)}"
+
+    if key in _ocr_text_cache:
+        return _ocr_text_cache[key]
+
+    import numpy as np
+
+    img_array = np.array(image)
+    text = ""
+    try:
+        import cv2
+        from geofind.utils.models import get_cached_model, ensure_easyocr_langs
+
+        if len(img_array.shape) == 3:
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = img_array
+
+        # CLAHE for local contrast enhancement
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        # Denoise
+        denoised = cv2.fastNlMeansDenoising(enhanced, h=10)
+
+        # Sharpen
+        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+        sharpened = cv2.filter2D(denoised, -1, kernel)
+
+        # Otsu binarization
+        _, binary = cv2.threshold(
+            sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+
+        langs = ensure_easyocr_langs()
+
+        def _load():
+            import easyocr
+            return easyocr.Reader(langs, gpu=False)
+
+        reader = get_cached_model("easyocr", _load)
+        results = reader.readtext(binary)
+        text = " ".join(r[1] for r in results if len(r) > 1)
+    except Exception:
+        text = ""
+
+    _ocr_text_cache[key] = text
+    return text
+
+
+def clear_ocr_cache() -> None:
+    """Drop cached OCR results (call when analyzing a new media file)."""
+    _ocr_text_cache.clear()

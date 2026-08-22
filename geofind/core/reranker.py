@@ -102,30 +102,108 @@ class BayesianReranker:
         if not module_centroids:
             return candidates, {"centroid_lat": None, "centroid_lon": None, "strength": 0.0}
 
-        # ── Find the densest cluster of module centroids ─────────────────
-        best_cluster_size = 0
-        best_lat, best_lon = 0.0, 0.0
-        best_total_weight = 0.0
+        # ── Dynamic GeoCLIP weight adjustment ───────────────────────────
+        # Only reduce GeoCLIP when it disagrees AND has low/medium confidence.
+        # When GeoCLIP has tight clusters (high confidence), trust it over weak modules.
+        adjusted_weights = dict(weights)
+        geoclip_centroids = [(lat, lon, w, n) for lat, lon, w, n in module_centroids if n == "geoclip"]
+        other_centroids = [(lat, lon, w, n) for lat, lon, w, n in module_centroids if n != "geoclip"]
 
-        for i in range(len(module_centroids)):
-            lat_i, lon_i, _, _ = module_centroids[i]
-            count = 0
-            w_lat, w_lon, w_sum = 0.0, 0.0, 0.0
-            for j in range(len(module_centroids)):
-                lat_j, lon_j, w_j, _ = module_centroids[j]
-                if _hav_km(lat_i, lon_i, lat_j, lon_j) < 300:
-                    count += 1
-                    w_lat += lat_j * w_j
-                    w_lon += lon_j * w_j
-                    w_sum += w_j
-            if count > best_cluster_size or (count == best_cluster_size and w_sum > best_total_weight):
-                best_cluster_size = count
-                best_total_weight = w_sum
-                best_lat = w_lat / max(w_sum, 1e-9)
-                best_lon = w_lon / max(w_sum, 1e-9)
+        # Check if GeoCLIP has tight clusters by looking at its hit distribution
+        geoclip_hits = all_hits.get("geoclip", [])
+        geoclip_is_tight = False
+        if geoclip_hits and len(geoclip_hits) >= 3:
+            gc_lats = [h.lat for h in geoclip_hits[:5]]
+            gc_lons = [h.lon for h in geoclip_hits[:5]]
+            gc_spread = max(
+                _hav_km(min(gc_lats), min(gc_lons), max(gc_lats), max(gc_lons)),
+                _hav_km(min(gc_lats), max(gc_lons), max(gc_lats), min(gc_lons)),
+            )
+            geoclip_is_tight = gc_spread < 200  # tight cluster = <200km spread
+
+        if geoclip_centroids and other_centroids:
+            ow_sum = sum(w for _, _, w, _ in other_centroids)
+            if ow_sum > 0:
+                other_lat = sum(la * w for la, _, w, _ in other_centroids) / ow_sum
+                other_lon = sum(lo * w for _, lo, w, _ in other_centroids) / ow_sum
+                gc_lat, gc_lon, gc_w, _ = geoclip_centroids[0]
+                gc_dist = _hav_km(gc_lat, gc_lon, other_lat, other_lon)
+                if gc_dist > 500 and not geoclip_is_tight:
+                    # Only reduce when GeoCLIP is uncertain/spread
+                    old_w = adjusted_weights.get("geoclip", 3.0)
+                    adjusted_weights["geoclip"] = old_w * 0.5
+                    logger.info(
+                        f"[reranker] GeoCLIP {gc_dist:.0f}km from module consensus (spread) — "
+                        f"reducing weight {old_w:.1f}→{adjusted_weights['geoclip']:.1f}"
+                    )
+                elif gc_dist > 500 and geoclip_is_tight:
+                    logger.info(
+                        f"[reranker] GeoCLIP {gc_dist:.0f}km from module consensus (tight cluster) — "
+                        f"keeping weight (high confidence)"
+                    )
+
+        # ── Find anchor: best available signal ───────────────────────────
+        # Strategy:
+        # 1. If GeoCLIP is tight (high confidence), use it as anchor
+        # 2. If region_voter has a country AND GeoCLIP is spread, use region_voter
+        # 3. Fall back to densest cluster of module centroids
+        best_lat, best_lon = 0.0, 0.0
+        best_cluster_size = 0
+        best_total_weight = 0.0
+        anchor_source = "cluster"
+
+        # Check if GeoCLIP has tight clusters (high confidence)
+        geoclip_anchor = None
+        geoclip_centroids_list = [(lat, lon, w) for lat, lon, w, n in module_centroids if n == "geoclip"]
+        if geoclip_centroids_list and geoclip_is_tight:
+            geoclip_anchor = geoclip_centroids_list[0]
+
+        rv_centroids = [(lat, lon, w) for lat, lon, w, n in module_centroids if n == "region_voter"]
+
+        if geoclip_anchor is not None:
+            # GeoCLIP has tight cluster — use it as anchor (more precise than country centroid)
+            best_lat, best_lon = geoclip_anchor[0], geoclip_anchor[1]
+            anchor_source = "geoclip"
+            best_cluster_size = sum(
+                1 for lat, lon, w, _ in module_centroids
+                if _hav_km(lat, lon, best_lat, best_lon) < 300
+            )
+            logger.info(
+                f"[reranker] Using GeoCLIP ({best_lat:.2f}, {best_lon:.2f}) as anchor "
+                f"(tight cluster, high confidence)"
+            )
+        elif rv_centroids:
+            # Region voter as fallback anchor
+            rv_centroids.sort(key=lambda x: -x[2])
+            best_lat, best_lon = rv_centroids[0][0], rv_centroids[0][1]
+            anchor_source = "region_voter"
+            best_cluster_size = sum(
+                1 for lat, lon, w, _ in module_centroids
+                if _hav_km(lat, lon, best_lat, best_lon) < 300
+            )
+            logger.info(
+                f"[reranker] Using region_voter ({best_lat:.2f}, {best_lon:.2f}) as anchor"
+            )
+        else:
+            # Fallback: find densest cluster of module centroids
+            for i in range(len(module_centroids)):
+                lat_i, lon_i, _, _ = module_centroids[i]
+                count = 0
+                w_lat, w_lon, w_sum = 0.0, 0.0, 0.0
+                for j in range(len(module_centroids)):
+                    lat_j, lon_j, w_j, _ = module_centroids[j]
+                    if _hav_km(lat_i, lon_i, lat_j, lon_j) < 300:
+                        count += 1
+                        w_lat += lat_j * w_j
+                        w_lon += lon_j * w_j
+                        w_sum += w_j
+                if count > best_cluster_size or (count == best_cluster_size and w_sum > best_total_weight):
+                    best_cluster_size = count
+                    best_total_weight = w_sum
+                    best_lat = w_lat / max(w_sum, 1e-9)
+                    best_lon = w_lon / max(w_sum, 1e-9)
 
         # ── Compute agreement strength ──────────────────────────────────
-        # Base: fraction of all modules in the best cluster
         base_strength = best_cluster_size / max(len(module_centroids), 1)
 
         # Boost when high-weight modules agree
@@ -142,8 +220,11 @@ class BayesianReranker:
         else:
             strength = base_strength
 
+        # Don't artificially inflate strength — let the actual agreement determine it
+        # (Removed aggressive region_voter minimum strength override)
+
         # Pair agreement bonus for high-weight modules
-        high_weight_names = {"geoclip", "landmark", "clip_visual", "vision_llm"}
+        high_weight_names = {"geoclip", "landmark", "clip_visual", "clip_retrieval", "region_voter"}
         hw_centroids = [
             (lat, lon, name) for lat, lon, w, name in module_centroids
             if name in high_weight_names
@@ -160,7 +241,7 @@ class BayesianReranker:
         logger.info(
             f"[reranker] Consensus: {best_cluster_size}/{len(module_centroids)} modules "
             f"agree within 300km, strength={strength:.2f}, "
-            f"centroid=({best_lat:.2f}, {best_lon:.2f})"
+            f"centroid=({best_lat:.2f}, {best_lon:.2f}), anchor={anchor_source}"
         )
 
         # ── Apply proximity-based buffs to candidates ────────────────────
@@ -187,11 +268,11 @@ class BayesianReranker:
 
         for rank, idx in enumerate(sorted_by_dist):
             if rank < top_n:
-                candidates[idx].buff_multiplier = 5.0  # Strong boost for consensus leaders
+                candidates[idx].buff_multiplier = 4.0  # Strong boost for consensus leaders
             elif rank < top_half:
-                candidates[idx].buff_multiplier = 2.0
+                candidates[idx].buff_multiplier = 1.5
             else:
-                candidates[idx].buff_multiplier = 1.0
+                candidates[idx].buff_multiplier = 0.5  # Mild penalty for far-away candidates
             # Scale buff by agreement strength
             candidates[idx].buff_multiplier = 1.0 + (candidates[idx].buff_multiplier - 1.0) * strength
 
@@ -218,6 +299,8 @@ class BayesianReranker:
         if not candidates or not consensus.get("centroid_lat"):
             return candidates
 
+        # The consensus centroid is already set to region_voter's centroid
+        # when region_voter is available (unified anchor from Pass 2)
         centroid_lat = consensus["centroid_lat"]
         centroid_lon = consensus["centroid_lon"]
 
@@ -238,18 +321,35 @@ class BayesianReranker:
         for i, candidate in enumerate(candidates):
             dist = float(dists_to_centroid[i])
 
-            # Proximity penalty for far-away candidates
-            if dist > 3000:
-                proximity_factor = math.exp(
-                    -((dist - 3000) ** 2) / (2 * 5000 ** 2)
-                )
-                candidate.probability *= (0.8 + 0.2 * proximity_factor)
+            # Progressive distance penalty
+            if dist > 500:
+                # Moderate penalty for far-away candidates (not too steep)
+                penalty = math.exp(-(dist / 600.0) ** 2 / 4.0)
+                candidate.probability *= max(0.05, penalty)
 
-            # Bonus for multi-module agreement at this candidate
-            if len(candidate.hits) >= 3:
+            # Strong bonus for multi-module agreement at this candidate
+            n_hits = len(candidate.hits)
+            if n_hits >= 4:
+                candidate.probability *= 2.0
+            elif n_hits >= 3:
+                candidate.probability *= 1.5
+            elif n_hits >= 2:
+                candidate.probability *= 1.3
+
+            # Region-aware bonus: count area-level modules agreeing
+            area_modules = {"ocr_text", "driving_side", "vegetation", "currency",
+                            "license_plate", "clip_visual", "places365", "region_voter"}
+            area_agreement = 0
+            for hit in candidate.hits:
+                if hit.module in area_modules:
+                    hit_sigma = getattr(hit, 'sigma_km', None)
+                    if hit_sigma is not None and hit_sigma >= 300:
+                        if _hav_km(hit.lat, hit.lon, candidate.lat, candidate.lon) < 400:
+                            area_agreement += 1
+            if area_agreement >= 3:
+                candidate.probability *= 1.4
+            elif area_agreement >= 2:
                 candidate.probability *= 1.2
-            elif len(candidate.hits) >= 2:
-                candidate.probability *= 1.1
 
         # Renormalize
         total = sum(c.probability for c in candidates)
